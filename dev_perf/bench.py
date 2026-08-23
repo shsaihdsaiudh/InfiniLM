@@ -54,6 +54,7 @@ def build_engine(args):
             device="cuda",
             dtype="bfloat16",
             cache_type="paged",
+            attn_backend="paged-attn",
             max_batch_size=64,
             enable_prefix_caching=True,
         )
@@ -70,7 +71,7 @@ def build_engine(args):
         def close():
             llm.close()
 
-        engine_notes = {"engine": "infinilm", "cuda_graph": False, "prefix_caching": True}
+        engine_notes = {"engine": "infinilm", "cuda_graph": False, "prefix_caching": True, "attn_backend": "paged-attn"}
 
     elif args.engine == "vllm":
         from vllm import LLM, SamplingParams

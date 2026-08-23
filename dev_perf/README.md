@@ -32,7 +32,7 @@
 ## 公平性约定
 
 - 贪心解码(temperature=0, top_k=1)、ignore_eos=True、逐字节相同的 prompt 与 max_tokens
-- vLLM 用 v1 默认(CUDA graph 开、prefix caching 开);InfiniLM 用 enable_graph=False、prefix caching 开——双方配置记入结果 JSON,差距解读时先考虑这两项
+- vLLM 用 v1 默认(CUDA graph 开、prefix caching 开);InfiniLM 用 enable_graph=False、paged-attn、prefix caching 开——双方配置记入结果 JSON,差距解读时先考虑这两项
 - 每个引擎先跑一轮 w1 预热(不计时),再正式计时
 
 ## 产出
