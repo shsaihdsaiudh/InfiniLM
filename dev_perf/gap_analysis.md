@@ -78,10 +78,35 @@ InfiniLM 均为 64blk；vLLM 为 `--gpu-mem-util 0.72`（13.97GB，86%）。
 4. 4B 64blk 已占 91% 显存仍无悬崖，再次印证悬崖只在 ~98% 极端饱和处；
    vLLM 0.85 档在 16GB 卡上会撞 97% 看门狗（w4 中途被 SIGTERM），0.72 正常。
 
+### prefill 差距的 kernel 级定位（nsys，2026-08-24）
+
+对 w2（3240 tok prefill + 128 decode）在 1.7B / 64blk 下分别抓 InfiniLM
+（no-graph）与 vLLM 的 CUDA 轨迹（`results/prof/*.nsys-rep`，分析脚本
+`results/prof/slice.py`）。prefill 窗口内 GPU busy 均 ~100%——差距在
+kernel 内部，不在调度/Python 开销。
+
+prefill 前向一次的 kernel 时间构成（3240 tokens）：
+
+| 成分 | InfiniLM | vLLM | 倍数 |
+|---|---|---|---|
+| prefill attention | **491ms**（PagedAttentionPrefillHd128WarpCta8Pipe，26 层 × ~19ms） | 36ms（FA2 splitkv，28 层 × 1.3ms） | **13.5×** |
+| rmsnorm + rope + swiglu | ~157ms（未融合，~590 次小 kernel） | ~20ms（triton 融合 kernel） | 7.8× |
+| gemm（qkv/o/gate/up/down） | 185ms | 212ms | 持平（略快） |
+| **合计** | **888ms / 1655 次调用** | **305ms / 706 次调用** | **2.9×** |
+
+结论：prefill 差距的第一来源是自研 `PagedAttentionPrefill` kernel 比
+FlashAttention-2 慢一个数量级（每层 19ms vs 1.3ms），第二来源是
+elementwise 链未融合。这是边界清晰、可度量的 kernel 优化目标：
+把 prefill attention 换成/优化到 FA2 量级，w2 的 prefill 段理论上可从
+~1.2s 压到 ~0.6s（1.7B 口径），e2e 差距从 1.3~1.5× 收敛到接近 1。
+
 ### 待办
 
 - [ ] （需看门狗临时放宽）nsys 抓 512blk 的 w1，直接观察 98% 悬崖机制。
-- [ ] （可选）nsys 对比 w2 prefill 路径，定位 1.5× prefill 差距。
+- [ ] prefill attention kernel 优化立项：先读 InfiniCore `paged_attention`
+      prefill 实现与 `flash_attention` 算子接口，确认是直接调 FA 还是手写；
+      目标"prefill attention 每层 19ms → ≤2ms（1.7B/3240tok/hd128）"。
+- [ ] （可选）elementwise 融合（rmsnorm/rope/swiglu）作为第二优化项。
 - [ ] Qwen3-8B-FP8 下载完成后，可作为 8B 级 + FP8 口径的复测对象。
 
 ---

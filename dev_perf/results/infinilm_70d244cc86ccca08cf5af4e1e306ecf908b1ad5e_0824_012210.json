@@ -1,0 +1,25 @@
+{
+  "timestamp": "2026-08-24T01:22:10",
+  "model": "/home/yyy/.cache/huggingface/hub/models--Qwen--Qwen3-1.7B/snapshots/70d244cc86ccca08cf5af4e1e306ecf908b1ad5e",
+  "engine": "infinilm",
+  "cuda_graph": false,
+  "prefix_caching": true,
+  "attn_backend": "paged-attn",
+  "num_blocks": 64,
+  "load_seconds": 50.07,
+  "mem_after_load_mib": 8040,
+  "mem_peak_mib": 8375,
+  "workloads": [
+    {
+      "workload": "w2_long_prefill",
+      "num_requests": 1,
+      "prompt_tokens_total": 3240,
+      "output_tokens_total": 128,
+      "e2e_seconds": 5.778,
+      "output_tokens_per_sec": 22.15,
+      "ms_per_output_token": 45.139,
+      "min_output_tokens": 128,
+      "max_output_tokens": 128
+    }
+  ]
+}

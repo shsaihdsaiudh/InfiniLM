@@ -134,6 +134,11 @@ def main():
         default=0.85,
         help="vllm only: gpu_memory_utilization; lower it to stay under VRAM watchdogs",
     )
+    parser.add_argument(
+        "--only",
+        default=None,
+        help="comma-separated workload names to run (default: all four)",
+    )
     args = parser.parse_args()
 
     # WSL2: vLLM disables pinned memory by default, which makes its V2 model
@@ -157,8 +162,11 @@ def main():
     w1_name, w1_prompts, w1_mt = WORKLOADS[0]
     generate(w1_prompts, w1_mt)
 
+    only = set(args.only.split(",")) if args.only else None
     results = []
     for name, prompts, max_tokens in WORKLOADS:
+        if only and name not in only:
+            continue
         t0 = time.perf_counter()
         outputs = generate(prompts, max_tokens)
         e2e = time.perf_counter() - t0
