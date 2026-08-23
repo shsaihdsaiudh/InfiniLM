@@ -249,7 +249,7 @@ def load_model_state_dict_by_file(
         with open(index_file_path, "r") as f:
             index_data = json.load(f)
         weight_map = index_data.get("weight_map", {})
-        unique_filenames = set(weight_map.values())
+        unique_filenames = sorted(set(weight_map.values()))
         file_list = [os.path.join(model_path, fname) for fname in unique_filenames]
     else:
         # Priority 2: If no index file, scan all safetensors files.

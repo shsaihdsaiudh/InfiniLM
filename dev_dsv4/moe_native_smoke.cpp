@@ -1,4 +1,5 @@
 #include "../csrc/models/deepseek_v4/deepseek_v4_moe.hpp"
+#include "../csrc/models/deepseek_v4/deepseek_v4_config.hpp"
 
 #include <infinicore/device.hpp>
 #include <infinicore/ops/cast.hpp>
@@ -22,7 +23,9 @@ using infinicore::DataType;
 using infinicore::Device;
 using infinicore::Shape;
 using infinicore::Tensor;
+using infinilm::models::deepseek_v4::DeepseekV4Experts;
 using infinilm::models::deepseek_v4::DeepseekV4SparseMoeBlock;
+using infinilm::models::deepseek_v4::create_deepseek_v4_model_config;
 
 Tensor to_device(std::vector<float> &values,
                  const Shape &shape,
@@ -44,6 +47,26 @@ Tensor i64_to_device(std::vector<int64_t> &values,
                      const Device &device) {
     return Tensor::from_blob(
                values.data(), shape, DataType::I64, Device::cpu())
+        ->to(device);
+}
+
+Tensor i32_to_device(std::vector<int32_t> &values,
+                     const Shape &shape,
+                     const Device &device) {
+    return Tensor::from_blob(
+               values.data(), shape, DataType::I32, Device::cpu())
+        ->to(device);
+}
+
+Tensor u8_slice_to_device(std::vector<uint8_t> &values,
+                          size_t offset,
+                          const Shape &shape,
+                          const Device &device) {
+    return Tensor::from_blob(
+               values.data() + offset,
+               shape,
+               DataType::U8,
+               Device::cpu())
         ->to(device);
 }
 
@@ -262,6 +285,239 @@ void require_close(const std::string &name,
     }
 }
 
+float decode_e2m1(uint8_t code) {
+    static constexpr float magnitudes[8] = {
+        0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
+    const float magnitude = magnitudes[code & 0x7];
+    return code & 0x8 ? -magnitude : magnitude;
+}
+
+float packed_dot(const float *input,
+                 const uint8_t *packed,
+                 const uint8_t *scales,
+                 size_t features) {
+    float result = 0.0f;
+    for (size_t packed_index = 0;
+         packed_index < features / 2;
+         ++packed_index) {
+        const int exponent =
+            static_cast<int>(scales[packed_index / 16]) - 127;
+        const uint8_t value = packed[packed_index];
+        result += input[2 * packed_index]
+                * std::ldexp(decode_e2m1(value & 0xf), exponent);
+        result += input[2 * packed_index + 1]
+                * std::ldexp(decode_e2m1(value >> 4), exponent);
+    }
+    return result;
+}
+
+std::vector<float> packed_moe_reference(
+    const std::vector<float> &hidden,
+    const std::vector<int32_t> &selected,
+    const std::vector<float> &routing,
+    const std::vector<uint8_t> &w13,
+    const std::vector<uint8_t> &w13_scale,
+    const std::vector<uint8_t> &w2,
+    const std::vector<uint8_t> &w2_scale,
+    size_t tokens,
+    size_t hidden_size,
+    size_t intermediate_size,
+    size_t top_k,
+    float limit,
+    bool &clamp_exercised) {
+    const size_t w13_packed_row = hidden_size / 2;
+    const size_t w13_scale_row = hidden_size / 32;
+    const size_t w2_packed_row = intermediate_size / 2;
+    const size_t w2_scale_row = intermediate_size / 32;
+    std::vector<float> output(tokens * hidden_size, 0.0f);
+    std::vector<float> activated(intermediate_size);
+    for (size_t token = 0; token < tokens; ++token) {
+        const float *token_input = hidden.data() + token * hidden_size;
+        for (size_t rank = 0; rank < top_k; ++rank) {
+            const size_t route = token * top_k + rank;
+            const size_t expert = static_cast<size_t>(selected[route]);
+            for (size_t i = 0; i < intermediate_size; ++i) {
+                const size_t gate_row =
+                    expert * 2 * intermediate_size + i;
+                const size_t up_row = gate_row + intermediate_size;
+                const float gate = packed_dot(
+                    token_input,
+                    w13.data() + gate_row * w13_packed_row,
+                    w13_scale.data() + gate_row * w13_scale_row,
+                    hidden_size);
+                const float up = packed_dot(
+                    token_input,
+                    w13.data() + up_row * w13_packed_row,
+                    w13_scale.data() + up_row * w13_scale_row,
+                    hidden_size);
+                clamp_exercised = clamp_exercised
+                    || gate > limit || std::abs(up) > limit;
+                const float bounded_gate = std::min(gate, limit);
+                const float bounded_up = std::clamp(up, -limit, limit);
+                activated[i] =
+                    bounded_gate / (1.0f + std::exp(-bounded_gate))
+                    * bounded_up;
+            }
+            for (size_t h = 0; h < hidden_size; ++h) {
+                const size_t row = expert * hidden_size + h;
+                output[token * hidden_size + h] += routing[route]
+                    * packed_dot(
+                        activated.data(),
+                        w2.data() + row * w2_packed_row,
+                        w2_scale.data() + row * w2_scale_row,
+                        intermediate_size);
+            }
+        }
+    }
+    return output;
+}
+
+void run_packed_fp4_smoke(const Device &device) {
+    constexpr size_t tokens = 3;
+    constexpr size_t hidden_size = 64;
+    constexpr size_t intermediate_size = 64;
+    constexpr size_t num_experts = 4;
+    constexpr size_t top_k = 2;
+    constexpr float limit = 10.0f;
+    const size_t w13_expert_bytes =
+        2 * intermediate_size * hidden_size / 2;
+    const size_t w13_expert_scales =
+        2 * intermediate_size * hidden_size / 32;
+    const size_t w2_expert_bytes =
+        hidden_size * intermediate_size / 2;
+    const size_t w2_expert_scales =
+        hidden_size * intermediate_size / 32;
+
+    std::vector<float> hidden(tokens * hidden_size);
+    for (size_t token = 0; token < tokens; ++token) {
+        for (size_t i = 0; i < hidden_size; ++i) {
+            hidden[token * hidden_size + i] =
+                static_cast<float>((i % 11) + 1) * 0.02f
+                * static_cast<float>(token + 1);
+        }
+    }
+    std::vector<int32_t> selected{0, 1, 2, 3, 1, 3};
+    std::vector<float> routing{0.7f, 0.3f, 0.4f, 0.6f, 0.25f, 0.75f};
+    std::vector<uint8_t> w13(num_experts * w13_expert_bytes);
+    std::vector<uint8_t> w13_scale(
+        num_experts * w13_expert_scales, 127);
+    std::vector<uint8_t> w2(num_experts * w2_expert_bytes);
+    std::vector<uint8_t> w2_scale(
+        num_experts * w2_expert_scales, 123);
+    for (size_t expert = 0; expert < num_experts; ++expert) {
+        const uint8_t gate_code = expert % 2 == 0 ? 0x66 : 0x55;
+        std::fill_n(
+            w13.begin() + expert * w13_expert_bytes,
+            intermediate_size * hidden_size / 2,
+            gate_code);
+        std::fill_n(
+            w13.begin() + expert * w13_expert_bytes
+                + intermediate_size * hidden_size / 2,
+            intermediate_size * hidden_size / 2,
+            static_cast<uint8_t>(expert < 2 ? 0x66 : 0xee));
+    }
+    for (size_t i = 0; i < w2.size(); ++i) {
+        const uint8_t low = static_cast<uint8_t>(1 + (i % 6));
+        const uint8_t high = static_cast<uint8_t>(
+            1 + ((i + 3) % 6) + ((i / 7) % 3 == 0 ? 8 : 0));
+        w2[i] = static_cast<uint8_t>((high << 4) | low);
+    }
+
+    bool clamp_exercised = false;
+    const auto expected = packed_moe_reference(
+        hidden,
+        selected,
+        routing,
+        w13,
+        w13_scale,
+        w2,
+        w2_scale,
+        tokens,
+        hidden_size,
+        intermediate_size,
+        top_k,
+        limit,
+        clamp_exercised);
+    if (!clamp_exercised) {
+        throw std::runtime_error(
+            "packed FP4 smoke did not exercise the SwiGLU limit");
+    }
+
+    DeepseekV4Experts experts(
+        num_experts,
+        hidden_size,
+        intermediate_size,
+        limit,
+        true,
+        DataType::F32,
+        device);
+    std::unordered_map<std::string, Tensor> parameters;
+    for (size_t expert = 0; expert < num_experts; ++expert) {
+        const std::string prefix = std::to_string(expert) + ".";
+        const size_t w13_byte_offset = expert * w13_expert_bytes;
+        const size_t w13_scale_offset = expert * w13_expert_scales;
+        parameters.emplace(
+            prefix + "w1.weight_packed",
+            u8_slice_to_device(
+                w13,
+                w13_byte_offset,
+                {intermediate_size, hidden_size / 2},
+                device));
+        parameters.emplace(
+            prefix + "w1.weight_scale",
+            u8_slice_to_device(
+                w13_scale,
+                w13_scale_offset,
+                {intermediate_size, hidden_size / 32},
+                device));
+        parameters.emplace(
+            prefix + "w3.weight_packed",
+            u8_slice_to_device(
+                w13,
+                w13_byte_offset + intermediate_size * hidden_size / 2,
+                {intermediate_size, hidden_size / 2},
+                device));
+        parameters.emplace(
+            prefix + "w3.weight_scale",
+            u8_slice_to_device(
+                w13_scale,
+                w13_scale_offset + intermediate_size * hidden_size / 32,
+                {intermediate_size, hidden_size / 32},
+                device));
+        parameters.emplace(
+            prefix + "w2.weight_packed",
+            u8_slice_to_device(
+                w2,
+                expert * w2_expert_bytes,
+                {hidden_size, intermediate_size / 2},
+                device));
+        parameters.emplace(
+            prefix + "w2.weight_scale",
+            u8_slice_to_device(
+                w2_scale,
+                expert * w2_expert_scales,
+                {hidden_size, intermediate_size / 32},
+                device));
+    }
+    experts.load_parameters_no_sync(parameters, true);
+    if (experts.state_dict_keys().size() != parameters.size()) {
+        throw std::runtime_error(
+            "DeepSeek-V4 packed expert state-dict key mismatch");
+    }
+    auto hidden_device = to_device(
+        hidden, {tokens, hidden_size}, device, DataType::F32);
+    auto selected_device = i32_to_device(
+        selected, {tokens, top_k}, device);
+    auto routing_device = to_device(
+        routing, {tokens, top_k}, device, DataType::F32);
+    require_close(
+        "packed_fp4_f32",
+        to_host(experts.forward(
+            hidden_device, selected_device, routing_device)),
+        expected,
+        2e-3f);
+}
+
 std::shared_ptr<infinilm::config::ModelConfig> make_config(
     bool hash,
     const DataType &dtype) {
@@ -283,9 +539,53 @@ std::shared_ptr<infinilm::config::ModelConfig> make_config(
     return std::make_shared<infinilm::config::ModelConfig>(config);
 }
 
+void run_official_config_smoke() {
+    std::vector<size_t> compress_ratios{0, 0};
+    for (size_t layer = 2; layer < 43; ++layer) {
+        compress_ratios.push_back(layer % 2 == 0 ? 4 : 128);
+    }
+    compress_ratios.insert(compress_ratios.end(), {0, 0, 0});
+    nlohmann::json released_config{
+        {"model_type", "deepseek_v4"},
+        {"torch_dtype", "bfloat16"},
+        {"num_hidden_layers", 43},
+        {"head_dim", 512},
+        {"qk_rope_head_dim", 64},
+        {"n_routed_experts", 256},
+        {"num_experts_per_tok", 6},
+        {"num_hash_layers", 3},
+        {"hc_mult", 4},
+        {"hc_sinkhorn_iters", 20},
+        {"compress_ratios", compress_ratios},
+        {"expert_dtype", "fp4"},
+    };
+    auto normalized = create_deepseek_v4_model_config(
+        std::make_shared<infinilm::config::ModelConfig>(released_config));
+    const auto &config = normalized->get_config_json();
+    const auto &layer_types = config.at("layer_types");
+    const auto &mlp_layer_types = config.at("mlp_layer_types");
+    if (layer_types.size() != 43
+        || layer_types.at(0) != "sliding_attention"
+        || layer_types.at(2) != "compressed_sparse_attention"
+        || layer_types.at(3) != "heavily_compressed_attention"
+        || config.at("compress_rates").at("compressed_sparse_attention") != 4
+        || config.at("compress_rates").at("heavily_compressed_attention") != 128
+        || mlp_layer_types.at(0) != "hash_moe"
+        || mlp_layer_types.at(2) != "hash_moe"
+        || mlp_layer_types.at(3) != "moe"
+        || config.at("num_experts") != 256
+        || config.at("expert_dtype") != "fp4"
+        || config.at("dtype") != "bfloat16") {
+        throw std::runtime_error(
+            "released DeepSeek-V4 config normalization mismatch");
+    }
+    std::cout << "released_config normalization passed\n";
+}
+
 } // namespace
 
 int main() {
+    run_official_config_smoke();
     constexpr size_t tokens = 3;
     constexpr size_t hidden_size = 4;
     constexpr size_t num_experts = 3;
@@ -415,6 +715,7 @@ int main() {
 
     run(DataType::F32, "_f32", 5e-4f);
     run(DataType::BF16, "_bf16", 3e-2f);
+    run_packed_fp4_smoke(device);
     std::cout << "DeepSeek-V4 native MoE smoke passed\n";
     return 0;
 }

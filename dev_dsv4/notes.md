@@ -393,3 +393,34 @@ INFINI_ROOT="$HOME/.infini-dsv4" dev_dsv4/run_model_native_smoke.sh
 
 下一步验证真实 checkpoint 的 FP8 dense 反量化、MXFP4 packed expert 布局和
 本地可执行语义；完整约 155 GiB 权重的加载与短提示推理留到租用服务器后完成。
+
+---
+
+## 验证笔记 #11：YaRN、真实 FP4 语义与服务器验收边界（2026-08-24）
+
+本地可完成的真权重前置工作已经闭环：
+
+- compressed layer 支持发布配置的 YaRN（factor=16、beta_fast=32、
+  beta_slow=1、original context=65536、compress theta=160000）；完整五层 tiny
+  模型的 YaRN prefill hidden/logits 最大误差为 `4.725099e-3` / `1.449406e-3`，
+  4 步 decode 最大误差为 `3.758430e-3` / `1.114845e-3`；
+- 发布配置没有 `compress_rates`，native config 会从既定层型补出 CSA=4、
+  HCA=128；原生 config smoke 已验证 43 层调度、前三层 Hash-MoE 和 FP4 别名；
+- InfiniCore MXFP4 fused MoE 新增 V4 `SwigluLimit10` activation，在 gate 上限 10、
+  up 的 `[-10, 10]` 区间执行截断；CPU/NVIDIA 的 FP16/BF16/FP32 共 24 个用例
+  全部通过，并有断言保证测试数据确实触发 clamp；
+- InfiniLM packed expert smoke 覆盖逐专家 `w1/w3/w2` 的 U8 weight/scale 参数
+  注册、切片加载和 fused forward；独立 CPU E2M1/E8M0 解码参考与 NVIDIA F32
+  输出最大误差 `1.22070e-4`；
+- loader 固定按 shard 名排序；dense FP8/FP4 bit-pattern 回归仍为 `3 passed`。
+
+增强后的远端 header probe 同时校验官方 config、72,317 个 tensor、35,718 组
+weight/scale 同 shard、FP8 block scale shape、FP4 专家 shape 和关键 mHC/压缩参数。
+统计口径修正后：checkpoint 总计 155.418 GiB，其中 MTP 为 10.117 GiB；当前
+base loader 丢弃 `mtp.*`，dense FP8 转 BF16 后估算常驻参数 150.756 GiB。
+
+最终服务器脚本 `dev_dsv4/run_real_checkpoint_smoke.sh` 已准备好，包含 48-shard
+完整性、FP4 config、至少 165 GiB 空闲显存的 preflight，以及加载后的 prefill
+NaN/Inf 检查和 4-token decode。服务器规格、B200/B300 `sm_100f` 构建命令和
+通过标准见 `dev_dsv4/server_validation.md`。至此剩余唯一无法在本机完成的动作是
+租用一张满足显存门槛的服务器并执行该真权重命令。

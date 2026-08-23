@@ -2,7 +2,7 @@
 set -euo pipefail
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-infini_root=${INFINI_ROOT:-"$HOME/.infini"}
+infini_root=${INFINI_ROOT:-"$HOME/.infini-dsv4"}
 cuda_home=${CUDA_HOME:-"$HOME/.local/cuda-13.2"}
 output="$repo_root/build/linux/x86_64/release/mhc_native_smoke"
 mkdir -p "$(dirname "$output")"

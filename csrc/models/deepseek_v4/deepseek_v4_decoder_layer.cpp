@@ -24,6 +24,33 @@ DeepseekV4DecoderLayer::DeepseekV4DecoderLayer(
             "DeepSeek-V4 decoder layer index is out of range");
     }
     layer_type_ = layer_types.at(layer_idx_).get<std::string>();
+    const nlohmann::json *rope_scaling = nullptr;
+    if (config.contains("rope_parameters")
+        && config.at("rope_parameters").is_object()
+        && config.at("rope_parameters").contains("compress")
+        && config.at("rope_parameters").at("compress").is_object()) {
+        rope_scaling = &config.at("rope_parameters").at("compress");
+    } else if (config.contains("rope_scaling")
+               && config.at("rope_scaling").is_object()) {
+        rope_scaling = &config.at("rope_scaling");
+    }
+    if (rope_scaling != nullptr) {
+        const std::string rope_type = rope_scaling->value(
+            "rope_type", rope_scaling->value("type", std::string{"default"}));
+        if (rope_type == "yarn") {
+            compress_yarn_ = DeepseekV4YarnScaling{
+                rope_scaling->at("factor").get<double>(),
+                rope_scaling->value("beta_fast", 32.0),
+                rope_scaling->value("beta_slow", 1.0),
+                rope_scaling->at("original_max_position_embeddings")
+                    .get<size_t>(),
+                rope_scaling->value("attention_factor", 1.0),
+                rope_scaling->value("truncate", true)};
+        } else if (rope_type != "default") {
+            throw std::runtime_error(
+                "DeepSeek-V4 compress RoPE supports only default or yarn");
+        }
+    }
     if (layer_type_ != "sliding_attention") {
         compress_rate_ = config.at("compress_rates")
                              .at(layer_type_)
@@ -85,7 +112,8 @@ DeepseekV4DecoderLayer::compressed_rotary_(
         rope_dim_,
         compress_rope_theta_,
         dtype_,
-        device_);
+        device_,
+        compress_yarn_);
 }
 
 infinicore::Tensor DeepseekV4DecoderLayer::forward(
@@ -109,7 +137,8 @@ infinicore::Tensor DeepseekV4DecoderLayer::forward(
             rope_dim_,
             compress_rope_theta_,
             dtype_,
-            device_);
+            device_,
+            compress_yarn_);
         attention_cos = compressed_query_rope.first;
         attention_sin = compressed_query_rope.second;
     }

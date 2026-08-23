@@ -398,8 +398,6 @@ infinicore::Tensor DeepseekV4Experts::forward(
             "DeepSeek-V4 experts input shape mismatch");
     }
     if (use_packed_fp4_) {
-        // The current InfiniCore MXFP4 SwiGLU kernel is structurally correct,
-        // but still needs the V4 gate/up clamp fused into its activation path.
         return infinicore::op::fused_moe_mxfp4(
             hidden_states,
             selected_experts,
@@ -408,7 +406,7 @@ infinicore::Tensor DeepseekV4Experts::forward(
             w13_scale_,
             packed_w2_,
             w2_scale_,
-            infinicore::op::FusedMoeActivation::Swiglu);
+            infinicore::op::FusedMoeActivation::SwigluLimit10);
     }
 
     const auto selected = tensor_to_i64(selected_experts);

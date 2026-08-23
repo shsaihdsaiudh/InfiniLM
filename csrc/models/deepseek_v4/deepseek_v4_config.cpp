@@ -1,5 +1,6 @@
 #include "deepseek_v4_config.hpp"
 
+#include <cstdint>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -97,6 +98,24 @@ create_deepseek_v4_model_config(
                 compress_ratios.at(layer).get<size_t>()));
         }
         config["layer_types"] = std::move(layer_types);
+    }
+
+    if (!config.contains("compress_rates")) {
+        config["compress_rates"] = {
+            {"compressed_sparse_attention", 4},
+            {"heavily_compressed_attention", 128}};
+    }
+    const auto &compress_rates = config.at("compress_rates");
+    for (const char *layer_type : {
+             "compressed_sparse_attention",
+             "heavily_compressed_attention"}) {
+        if (!compress_rates.contains(layer_type)
+            || !compress_rates.at(layer_type).is_number_integer()
+            || compress_rates.at(layer_type).get<int64_t>() <= 0) {
+            throw std::runtime_error(
+                std::string{"DeepSeek-V4: invalid compress rate for "}
+                + layer_type);
+        }
     }
 
     if (!config.contains("mlp_layer_types")) {

@@ -195,6 +195,11 @@ def main():
     parser.add_argument("--decode-steps", type=int, default=4)
     parser.add_argument("--atol", type=float, default=1e-2)
     parser.add_argument(
+        "--yarn",
+        action="store_true",
+        help="enable the released checkpoint's compress-layer YaRN settings",
+    )
+    parser.add_argument(
         "--zero-sublayers",
         action="store_true",
         help="zero attention and MoE weights to isolate the residual/HC path",
@@ -207,6 +212,16 @@ def main():
     args = parser.parse_args()
 
     saved = torch.load(BASELINE, map_location="cpu", weights_only=False)
+    if args.yarn:
+        saved["config"] = dict(saved["config"])
+        saved["config"]["max_position_embeddings"] = 1048576
+        saved["config"]["rope_scaling"] = {
+            "type": "yarn",
+            "factor": 16,
+            "beta_fast": 32,
+            "beta_slow": 1,
+            "original_max_position_embeddings": 65536,
+        }
     layer_counts = args.layers or [saved["config"]["num_hidden_layers"]]
     for num_layers in layer_counts:
         (

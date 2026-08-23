@@ -5,6 +5,7 @@
 #include "deepseek_v4_hca_compressor.hpp"
 #include "deepseek_v4_hyper_connection.hpp"
 #include "deepseek_v4_moe.hpp"
+#include "deepseek_v4_rotary_embedding.hpp"
 
 #include <infinicore/nn/module.hpp>
 #include <infinicore/tensor.hpp>
@@ -49,6 +50,7 @@ private:
     size_t compress_rate_{0};
     size_t rope_dim_;
     double compress_rope_theta_;
+    std::optional<DeepseekV4YarnScaling> compress_yarn_;
     infinicore::DataType dtype_;
     infinicore::Device device_;
 
