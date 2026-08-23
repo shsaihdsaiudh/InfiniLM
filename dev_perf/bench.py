@@ -114,6 +114,11 @@ def main():
     )
     args = parser.parse_args()
 
+    # WSL2: vLLM disables pinned memory by default, which makes its V2 model
+    # runner's UvaBuffer raise "UVA is not available". Pinned memory works on
+    # WSL2 kernels >= 4.19.121 (verified locally), so opt back in.
+    os.environ.setdefault("VLLM_WSL2_ENABLE_PIN_MEMORY", "1")
+
     args.model = resolve_model_path(args.model)
     print(f"[bench] engine={args.engine} model={args.model}", flush=True)
 
