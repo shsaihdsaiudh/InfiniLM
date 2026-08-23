@@ -242,3 +242,32 @@ native smoke 使用 `sliding_window=2`、序列长度 3，明确跨越窗口边�
 全量 InfiniLM C++ 构建、loader `3 passed`、四种官方 tiny 增量基线和 mHC
 FP32/BF16 smoke 均再次通过。下一步转入 HCA compressor；它比 CSA 少一个
 Lightning Indexer 分支，适合作为压缩注意力的第一条落地路径。
+
+---
+
+## 验证笔记 #6：HCA compressor 与跨 chunk 状态（2026-08-23）
+
+新增 `DeepseekV4HCACompressor`，实现 HCA 非重叠窗口压缩：
+
+- `kv_proj` / `gate_proj` 保留官方参数布局；
+- `gate + position_bias` 在窗口轴做 FP32 softmax，再转回 KV dtype 加权求和；
+- pooled KV 经 weighted RMSNorm 和 compress-RoPE；
+- 不足一个窗口的 projected KV/gate 余数跨调用保留；
+- 每闭合一个窗口追加一条长期 compressed KV，并维护 `entry_count`；
+- stateless 路径仅压缩本次调用中的完整窗口并丢弃余数；
+- 根据绝对 `position_ids` 生成 compressed-entry causal block bias。
+
+native smoke 使用压缩率 2、序列长度 5，并按 `[1, 2, 2]` 三个 chunk 输入，
+覆盖“首次无输出、缓存余数、连续闭合窗口、最终仍有余数”的完整状态机。
+最大绝对误差：
+
+- FP32 stateless：`1.78814e-7`；incremental/history：`5.96046e-8`；
+- BF16 stateless：`0.0074892`；incremental/history：`0`。
+
+block bias 同时检查了可见条目与未来条目的 `-inf` 屏蔽。当前 correctness
+实现会把 `position_ids` 同步到 CPU 构造该不规则 mask；接入 CUDA Graph 前需要
+替换为设备侧 mask kernel。全量 C++ 构建及 loader、官方 tiny 增量、mHC、
+sliding Attention 回归均通过。
+
+下一步是把 HCA 的 compressed KV 和 block bias 接入核心 Attention，使同一层
+同时消费短程 sliding KV 与长期 HCA KV，然后做端到端 HCA prefill/decode 对拍。
