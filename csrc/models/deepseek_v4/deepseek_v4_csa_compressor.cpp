@@ -654,6 +654,11 @@ DeepseekV4Indexer::Output DeepseekV4Indexer::forward(
                 compress_rate_,
                 scores->dtype(),
                 scores->device()));
+        // The CUDA top-k backend can discard valid candidates when every
+        // finite value in a row is negative.  Softmax is order preserving,
+        // maps finite candidates to positive values, and keeps causally
+        // masked -inf entries at zero.
+        scores = infinicore::op::softmax(scores, 2);
         indices = infinicore::op::topk(
                       scores, top_k, 2, true, true)
                       .second;

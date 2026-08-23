@@ -356,3 +356,40 @@ native smoke 对标准和 Hash 两条路由分别与独立 CPU 公式对拍：
 
 `_infinilm` 全量 C++ 扩展构建通过。下一步将 mHC、混合 attention 和 MoE 接入
 decoder/model，完成官方 tiny state dict 的整模型 prefill/decode 对拍。
+
+---
+
+## 验证笔记 #10：完整 Decoder / CausalLM 与 tiny 端到端对拍（2026-08-24）
+
+新增完整 `DeepseekV4DecoderLayer`、`DeepseekV4Model` 和
+`DeepseekV4ForCausalLM` correctness path：
+
+- embedding 后扩展为 `hc_mult` 条 residual streams，每层依次执行
+  mHC-attention、异构 attention、mHC-FFN 与 Hash/标准 MoE；
+- `layer_types` 在 sliding / CSA / HCA 间调度，并为每层独立维护 sliding KV、
+  compressor、indexer 及 overlap 状态；
+- sliding 层使用 main RoPE，CSA/HCA 的 query、短程 KV 和压缩条目统一使用
+  compress RoPE；
+- hyper head、最终 RMSNorm 与 LM head 已接线，模型以 `deepseek_v4` 注册到
+  CausalLM registry；当前 correctness path 明确限制 `PP=TP=1`；
+- 145 个官方 tiny state-dict key 与 native 模型精确一致，无缺失或多余参数。
+
+端到端 smoke 会重建同权重 Transformers 参照，默认验证完整 5 层混合模型的
+prefill 和 4 步增量 decode。FP32 结果：
+
+- prefill hidden 最大绝对误差 `3.738850e-3`，logits `1.593232e-3`；
+- 4 步 decode hidden 最大绝对误差 `3.736645e-3`，logits `1.099348e-3`。
+
+调试还暴露了 InfiniCore CUDA top-k 在一行所有有限候选均为负数时会漏选的
+边界问题。Indexer 在 top-k 前增加保序 softmax：有限分数变为正数、causal
+`-inf` 保持零概率，选择结果由此与官方实现一致。测试中的 Torch Tensor 必须
+保持到 native forward 完成，因为 `infinicore.from_torch` 是零拷贝视图。
+
+复现：
+
+```bash
+INFINI_ROOT="$HOME/.infini-dsv4" dev_dsv4/run_model_native_smoke.sh
+```
+
+下一步验证真实 checkpoint 的 FP8 dense 反量化、MXFP4 packed expert 布局和
+本地可执行语义；完整约 155 GiB 权重的加载与短提示推理留到租用服务器后完成。
