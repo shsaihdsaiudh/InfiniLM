@@ -2,12 +2,14 @@
 
 #include <infinicore/device.hpp>
 #include <infinicore/ops/cast.hpp>
+#include <infinicore/ops/cat.hpp>
 #include <infinicore/tensor.hpp>
 
 #include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <iostream>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -19,6 +21,7 @@ using infinicore::DataType;
 using infinicore::Device;
 using infinicore::Shape;
 using infinicore::Tensor;
+using infinilm::models::deepseek_v4::DeepseekV4Attention;
 using infinilm::models::deepseek_v4::DeepseekV4HCACompressor;
 using infinilm::models::deepseek_v4::DeepseekV4HCAState;
 
@@ -208,6 +211,12 @@ int main() {
     constexpr size_t rope_dim = 2;
     constexpr size_t compress_rate = 2;
     constexpr size_t entries = sequence_length / compress_rate;
+    constexpr size_t q_lora_rank = 3;
+    constexpr size_t num_heads = 2;
+    constexpr size_t o_groups = 2;
+    constexpr size_t o_lora_rank = 2;
+    constexpr size_t sliding_window = 2;
+    constexpr size_t group_input = num_heads * head_dim / o_groups;
     constexpr float eps = 1e-5f;
     const Device device(Device::Type::NVIDIA, 0);
 
@@ -218,13 +227,35 @@ int main() {
     std::vector<float> norm_weight(head_dim);
     std::vector<float> cos(entries * rope_dim / 2);
     std::vector<float> sin(entries * rope_dim / 2);
+    std::vector<float> query_cos(sequence_length * rope_dim / 2);
+    std::vector<float> query_sin(sequence_length * rope_dim / 2);
     std::vector<int64_t> positions(sequence_length);
+    std::vector<float> q_a_weight(q_lora_rank * hidden_size);
+    std::vector<float> q_a_norm_weight(q_lora_rank);
+    std::vector<float> q_b_weight(num_heads * head_dim * q_lora_rank);
+    std::vector<float> sliding_kv_weight(head_dim * hidden_size);
+    std::vector<float> sliding_kv_norm_weight(head_dim);
+    std::vector<float> o_a_weight(
+        o_groups * o_lora_rank * group_input);
+    std::vector<float> o_b_weight(
+        hidden_size * o_groups * o_lora_rank);
+    std::vector<float> sinks(num_heads);
     fill_wave(hidden, 0.67f, 0.19f);
     fill_wave(kv_weight, 0.28f, 0.13f);
     fill_wave(gate_weight, 0.24f, 0.23f);
     fill_wave(position_bias, 0.17f, 0.31f);
+    fill_wave(q_a_weight, 0.22f, 0.17f);
+    fill_wave(q_b_weight, 0.19f, 0.11f);
+    fill_wave(sliding_kv_weight, 0.25f, 0.07f);
+    fill_wave(o_a_weight, 0.20f, 0.29f);
+    fill_wave(o_b_weight, 0.18f, 0.09f);
     for (size_t i = 0; i < norm_weight.size(); ++i) {
         norm_weight[i] = 0.91f + 0.06f * static_cast<float>(i);
+        sliding_kv_norm_weight[i] =
+            1.07f - 0.04f * static_cast<float>(i);
+    }
+    for (size_t i = 0; i < q_a_norm_weight.size(); ++i) {
+        q_a_norm_weight[i] = 0.94f + 0.05f * static_cast<float>(i);
     }
     for (size_t entry = 0; entry < entries; ++entry) {
         const size_t position = entry * compress_rate;
@@ -234,7 +265,11 @@ int main() {
     }
     for (size_t token = 0; token < sequence_length; ++token) {
         positions[token] = static_cast<int64_t>(token);
+        const float angle = 0.21f * static_cast<float>(token + 1);
+        query_cos[token] = std::cos(angle);
+        query_sin[token] = std::sin(angle);
     }
+    sinks = {-0.27f, 0.36f};
     const auto reference = reference_hca(
         hidden,
         kv_weight,
@@ -366,6 +401,124 @@ int main() {
             to_host(state.compressed_kv),
             to_host(full.new_compressed_kv),
             tolerance);
+
+        DeepseekV4Attention hca_attention(
+            hidden_size,
+            q_lora_rank,
+            num_heads,
+            head_dim,
+            rope_dim,
+            o_groups,
+            o_lora_rank,
+            eps,
+            dtype,
+            device,
+            compress_rate);
+        std::unordered_map<std::string, Tensor> attention_parameters{
+            {"q_a_proj.weight", to_device(q_a_weight, {q_lora_rank, hidden_size}, device, dtype)},
+            {"q_a_norm.weight", to_device(q_a_norm_weight, {q_lora_rank}, device, dtype)},
+            {"q_b_proj.weight", to_device(q_b_weight, {num_heads * head_dim, q_lora_rank}, device, dtype)},
+            {"kv_proj.weight", to_device(sliding_kv_weight, {head_dim, hidden_size}, device, dtype)},
+            {"kv_norm.weight", to_device(sliding_kv_norm_weight, {head_dim}, device, dtype)},
+            {"o_a_proj.weight", to_device(o_a_weight, {o_groups * o_lora_rank, group_input}, device, dtype)},
+            {"o_b_proj.weight", to_device(o_b_weight, {hidden_size, o_groups * o_lora_rank}, device, dtype)},
+            {"sinks", to_device(sinks, {num_heads}, device, dtype)},
+            {"compressor.kv_proj.weight", to_device(kv_weight, {head_dim, hidden_size}, device, dtype)},
+            {"compressor.gate_proj.weight", to_device(gate_weight, {head_dim, hidden_size}, device, dtype)},
+            {"compressor.kv_norm.weight", to_device(norm_weight, {head_dim}, device, dtype)},
+            {"compressor.position_bias", to_device(position_bias, {compress_rate, head_dim}, device, dtype)},
+        };
+        hca_attention.load_parameters_no_sync(attention_parameters, true);
+        if (hca_attention.state_dict_keys().size()
+            != attention_parameters.size()) {
+            throw std::runtime_error(
+                "DeepSeek-V4 integrated HCA state-dict key mismatch");
+        }
+
+        auto query_cos_device = to_device(
+            query_cos, {1, sequence_length, rope_dim / 2}, device);
+        auto query_sin_device = to_device(
+            query_sin, {1, sequence_length, rope_dim / 2}, device);
+        auto hca_full = hca_attention.forward_hca(
+            hidden_device,
+            query_cos_device,
+            query_sin_device,
+            cos_device,
+            sin_device,
+            positions_device,
+            std::nullopt,
+            nullptr,
+            sliding_window);
+        if (hca_full.output->shape()
+                != Shape{1, sequence_length, hidden_size}
+            || hca_full.attention_weights->shape()
+                != Shape{1,
+                         num_heads,
+                         sequence_length,
+                         sequence_length + entries}
+            || hca_full.kv_cache->shape()
+                != Shape{1, sliding_window - 1, 1, head_dim}) {
+            throw std::runtime_error(
+                "DeepSeek-V4 integrated HCA prefill shape mismatch");
+        }
+        const auto full_weights = to_host(hca_full.attention_weights);
+        const size_t full_kv_length = sequence_length + entries;
+        for (size_t head = 0; head < num_heads; ++head) {
+            for (size_t token = 0; token < sequence_length; ++token) {
+                const size_t threshold = (token + 1) / compress_rate;
+                for (size_t entry = threshold; entry < entries; ++entry) {
+                    const size_t index =
+                        (head * sequence_length + token) * full_kv_length
+                        + sequence_length + entry;
+                    if (full_weights[index] != 0.0f) {
+                        throw std::runtime_error(
+                            "DeepSeek-V4 integrated HCA exposed a future compressed entry");
+                    }
+                }
+            }
+        }
+
+        DeepseekV4HCAState integrated_state;
+        std::optional<Tensor> sliding_cache;
+        std::vector<Tensor> token_outputs;
+        for (size_t token = 0; token < sequence_length; ++token) {
+            const size_t buffered = integrated_state.buffer_kv
+                ? integrated_state.buffer_kv->size(1)
+                : 0;
+            const size_t new_entries = (buffered + 1) / compress_rate;
+            const size_t compressed_offset = integrated_state.entry_count;
+            auto step = hca_attention.forward_hca(
+                hidden_device->narrow({{1, token, 1}})->contiguous(),
+                query_cos_device->narrow({{1, token, 1}})->contiguous(),
+                query_sin_device->narrow({{1, token, 1}})->contiguous(),
+                cos_device
+                    ->narrow({{1, compressed_offset, new_entries}})
+                    ->contiguous(),
+                sin_device
+                    ->narrow({{1, compressed_offset, new_entries}})
+                    ->contiguous(),
+                positions_device->narrow({{1, token, 1}})->contiguous(),
+                sliding_cache,
+                &integrated_state,
+                sliding_window);
+            sliding_cache = step.kv_cache;
+            token_outputs.push_back(step.output);
+        }
+        auto decoded_output = infinicore::op::cat(token_outputs, 1);
+        require_close(
+            "hca_prefill_decode" + suffix,
+            to_host(decoded_output),
+            to_host(hca_full.output),
+            tolerance);
+        if (integrated_state.entry_count != entries
+            || !integrated_state.buffer_kv
+            || integrated_state.buffer_kv->size(1)
+                   != sequence_length % compress_rate
+            || !sliding_cache.has_value()
+            || sliding_cache.value()->size(1) != sliding_window - 1) {
+            throw std::runtime_error(
+                "DeepSeek-V4 integrated HCA decode cache mismatch");
+        }
     };
 
     run(DataType::F32, "_f32", 5e-3f);

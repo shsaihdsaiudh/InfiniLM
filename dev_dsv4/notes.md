@@ -271,3 +271,34 @@ sliding Attention 回归均通过。
 
 下一步是把 HCA 的 compressed KV 和 block bias 接入核心 Attention，使同一层
 同时消费短程 sliding KV 与长期 HCA KV，然后做端到端 HCA prefill/decode 对拍。
+
+---
+
+## 验证笔记 #7：HCA Attention 端到端接线（2026-08-24）
+
+`DeepseekV4Attention::forward_hca` 已把短程 sliding KV 和长期 compressed KV
+接入同一个 attention softmax：
+
+- HCA 层按配置注册 `compressor` 子模块，参数键保持官方
+  `compressor.{kv_proj,gate_proj,kv_norm,position_bias}` 命名；
+- KV 按 `[sliding, compressed]` 顺序拼接，对两段分别应用滑窗 causal bias 和
+  compressed-entry block bias；
+- 单 token decode 没有 block bias 时，已有 compressed history 默认全部可见；
+- sliding cache 仍只保留最后 `sliding_window - 1` 个条目，HCA state 独立维护
+  projected 余数、compressed history 和 `entry_count`；
+- dense/sliding 层不注册 compressor，因此不会污染它们的 checkpoint key 集合。
+
+集成 smoke 使用压缩率 2、滑窗 2、序列长度 5，检查完整 prefill 的未来 HCA
+条目权重严格为 0，并与逐 token decode 拼接输出对拍：
+
+- FP32 prefill/decode 最大绝对误差：`5.19119e-6`；
+- BF16 prefill/decode 最大绝对误差：`0`；
+- compressor 独立参考对拍保持 FP32 `1.78814e-7`、BF16 `0.0074892`。
+
+全量 `_infinilm` 目标已在 ATen-enabled InfiniCore 下重新编译链接；loader
+`3 passed`、四种官方 tiny 增量基线（`<=1.1e-6`）、dense/sliding Attention 和
+mHC FP32/BF16 smoke 全部通过。当前 HCA correctness path 的已知生产化缺口仍是
+CPU 构造 block bias；后续需替换为设备侧 kernel，再进入 CUDA Graph 验证。
+
+下一步实现 CSA compressor 和 Lightning Indexer，优先先对齐 index score、top-k
+选择及稀疏 KV gather，再把异构层 cache 接入 decoder/model 调度。
