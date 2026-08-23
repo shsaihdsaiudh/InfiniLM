@@ -5,8 +5,8 @@
 ## 运行前提
 
 1. InfiniCore 已构建且 InfiniLM 已在主 checkout 构建(`python/infinilm/lib/_infinilm*.so` 存在)。运行时动态库路径由 bench.py 自动 re-exec 注入(LD_LIBRARY_PATH ← InfiniCore/InfiniLM 的 lib 目录),无需手动设置
-2. vLLM 独立环境:`/home/yyy/src/venvs/vllm-bench`(uv 创建,cu128 torch;**勿装进项目 .venv**,vllm 会锁定 torch 版本)
-3. GPU 空闲(本机常驻 llama-server 约占 11.4GB,压测前需要停)
+2. vLLM 独立环境:`/home/yyy/src/venvs/vllm-bench`(uv 创建,cu128 torch;**勿装进项目 .venv**,vllm 会锁定 torch 版本)。运行时需带齐 `PATH=<vllm-bench>/bin:$HOME/.local/cuda-13.2/bin:$PATH` 和 `CUDA_HOME=$HOME/.local/cuda-13.2`(否则 EngineCore 找不到 ninja 起不来)
+3. GPU 空闲(本机常驻 llama-server 约占 11.4GB,压测前需要停);本机有 97% 显存看门狗,vLLM 侧 `--gpu-mem-util` 不要超过 ~0.8(0.85 × 16GB + 基线占用会撞线)
 4. WSL2 下 vLLM 需 `VLLM_WSL2_ENABLE_PIN_MEMORY=1`(bench.py 已自动设置;否则 vLLM 禁用 pinned memory 导致 UvaBuffer 报 "UVA is not available")
 
 ## 运行

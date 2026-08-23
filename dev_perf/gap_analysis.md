@@ -1,19 +1,94 @@
 # 项目 #2 基线差距清单
 
-最新结论见 v2（2026-08-24）：v1 的四条归因假设被新数据推翻，主差距来源是
-KV cache 预分配策略，不是缺 CUDA graph。
+最新结论见 v3（2026-08-24）：劣化是显存 98% 极端饱和处的悬崖，不是随
+num_blocks 渐变；64~320 blocks 区间 InfiniLM 与 vLLM 持平，graph 再赚 ~10%。
 
 ---
 
-## v2（2026-08-24）：num_blocks 对照实验
+## v3（2026-08-24）：num_blocks 扫描与膝点定位
 
-动机：v1 数据采集时 InfiniLM 以默认 num_blocks=512 预分配 ~13GB KV cache，
-加载后显存 15.96GB（98%）。本轮用 `--num-blocks 64`（cache ~1.8GB，全程
-峰值 ~8.1GB）重跑，并补上了 graph 对照轮。
+模型 Qwen3-1.7B（bf16），RTX 5060 Ti 16GB（WSL2），全部 no-graph。
 
-模型 Qwen3-1.7B（bf16），RTX 5060 Ti 16GB（WSL2）。
+| num_blocks | 加载后显存 | w1 ms/tok | w2 e2e | w3 tok/s | w4 ms/tok |
+|---|---|---|---|---|---|
+| 64 | 7.9GB（48%） | 11.9 / 12.6（两次） | 2.70 / 2.80 | 1995 / 1870 | 12.3 / 14.1 |
+| 128 | 9.8GB（60%） | 13.3 | 2.81 | 1852 | 13.9 |
+| 256 | 13.3GB（82%） | 13.3 | 2.82 | 1816 | 13.8 |
+| 320 | 15.4GB（94%） | 13.5 | 2.81 | 1850 | 13.5 |
+| 512（v1 数据） | 16.0GB（98%） | **33.2** | **42.0s** | **42** | **47.9** |
 
-| 负载 | InfiniLM 512blk no-graph（v1） | InfiniLM 64blk no-graph | InfiniLM 64blk graph | vLLM（v1 默认） |
+run 间波动约 ±10%（64blk 两次复测所得），64~320 之间的差异在波动范围内。
+
+### v3 结论
+
+1. **劣化是 98% 极端饱和处的悬崖，不是渐变**：48%~94% 全区间性能持平，
+   只有 512blk（98%）坠崖。排除"engine 内 O(num_blocks) 的 per-step 开销"
+   假设，指向显存近满时分配慢路径/驱动行为（WSL2）。具体机制需 profile
+   512blk 配置确认，但该配置会触发本机 97% 显存看门狗，暂被阻塞。
+2. **CUDA graph 收益 ~10%**（v2 的 64blk 对照：w1 11.9→10.7、w4 12.3→11.1、
+   w3 +7%、w2 -5%），与 num_blocks 无关。值得默认开启，但不是量级差距。
+3. **工程缺陷确认**：默认 num_blocks=512 在 16GB 卡上必踩悬崖，且全程无
+   告警。可立项方向：cache 预分配按显存自适应（预留 ≥5~10% headroom）或
+   近饱和时显式告警。
+4. v1 的全部四条差距假设（launch 开销、prefill 路径、批处理串行、decode
+   随长度劣化）均为该悬崖的表现，逐条推翻，详见 v1 存档节。
+
+### 机制分析（代码侧，主 checkout 调查结论）
+
+- 分配链：`llm.py` num_blocks → `PagedKVCacheConfig` → 逐层
+  `Tensor::zeros({2, num_blocks, 256, kv_heads, head_dim})`
+  （`csrc/cache/kv_cache.cpp:142`）。Qwen3-1.7B 为每层 512MiB × 28 = 14GiB，
+  与实测吻合。底层是 InfiniCore `PinnableBlockAllocator`——裸 cudaMalloc +
+  尺寸分级 free-list 缓存。
+- **稳态 decode 每步零新设备分配**：8 个 CPU 输入 tensor 逐个 H2D、各层
+  attention workspace、采样 workspace 全部命中分配器缓存；没有任何
+  per-step 开销随 num_blocks 增长。512 vs 320 的 3~50× 劣化**不可能是引擎
+  算法开销**——代码侧排除了引擎内因素。
+- 分配器失败行为是"报错即死"（throw → exit(137)），无重试、无碎片整理、
+  无自动 trim；近饱和**全程无任何告警**，只有启动时一行
+  `Using Paged KV Cache with num_blocks=512`。
+- 加载耗时 59.5s（512blk）vs 3.9s（64blk）跑的是完全相同的代码路径
+  （28 次 cudaMalloc(512MB) + 设备清零 + 权重 H2D），15× 差距只能来自
+  cudaMalloc/kernel 执行本身，即驱动/内存子系统。
+- 综合判断：悬崖在引擎之下——WSL2（dxgkrnl）显存近满时的
+  paging/eviction/residency 抖动是最可疑机制，可统一解释"含稳态零新分配
+  的 decode 在内全部变慢"。最终确认需 nsys/driver 计数器（被看门狗阻塞）。
+
+### Qwen3-4B 三配置复测（2026-08-24，与 v3 同机）
+
+InfiniLM 均为 64blk；vLLM 为 `--gpu-mem-util 0.72`（13.97GB，86%）。
+带宽口径：4B bf16 权重 ~8GB，5060 Ti 理论 decode 上限 ~56 tok/s。
+
+| 负载 | InfiniLM no-graph | InfiniLM graph | vLLM |
+|---|---|---|---|
+| w1 单请求 decode | 25.6 ms/tok（39.1 tok/s） | 24.3（41.2） | 23.0（43.4） |
+| w2 长 prefill + 128 decode | 5.94s | 5.79s | **3.84s** |
+| w3 batch32 总吞吐 | 891 tok/s | 944 tok/s | 841 tok/s |
+| w4 长 decode | 26.7 ms/tok | 25.0 | 23.7 |
+| 加载耗时 / 显存 | 18.0s / 14.86GB（91%） | 37.0s / 14.82GB | 43.3s / 13.97GB |
+
+结论：
+
+1. **"持平"在 4B 上成立**：decode 三家都在带宽上限的 74~77%，w3 InfiniLM
+   略优，w4 基本持平。
+2. **唯一持续存在的真实差距是长 prefill**：vLLM 比 InfiniLM 快 ~1.5×
+   （1.7B 时 ~1.3×）。vLLM 开了 chunked prefill（max_num_batched_tokens=
+   8192），这是下一个值得 profile 的点，但量级是 1.5× 而非数量级。
+3. graph 在 4B 上收益收窄到 ~5%（w1 25.6→24.3，w4 26.7→25.0）。
+4. 4B 64blk 已占 91% 显存仍无悬崖，再次印证悬崖只在 ~98% 极端饱和处；
+   vLLM 0.85 档在 16GB 卡上会撞 97% 看门狗（w4 中途被 SIGTERM），0.72 正常。
+
+### 待办
+
+- [ ] （需看门狗临时放宽）nsys 抓 512blk 的 w1，直接观察 98% 悬崖机制。
+- [ ] （可选）nsys 对比 w2 prefill 路径，定位 1.5× prefill 差距。
+- [ ] Qwen3-8B-FP8 下载完成后，可作为 8B 级 + FP8 口径的复测对象。
+
+---
+
+## v2 存档（2026-08-24）：64blk 对照实验原始表
+
+| 负载 | InfiniLM 512blk no-graph | InfiniLM 64blk no-graph | InfiniLM 64blk graph | vLLM（v1 默认） |
 |---|---|---|---|---|
 | w1 单请求 decode | 33.2 ms/tok | 11.9 ms/tok | **10.7 ms/tok** | 12.0 ms/tok |
 | w2 长 prefill + 128 decode | 42.0s | 2.70s | 2.56s | 2.0s |
@@ -22,39 +97,9 @@ KV cache 预分配策略，不是缺 CUDA graph。
 | 加载耗时 | 59.5s | 3.9s | 11.6s（含 graph 编译） | 24.0s |
 | 加载后显存 | 15.96GB | 7.89GB | 8.07GB | 15.89GB |
 
-数据文件：`results/infinilm_..._0824_005235.json`（64blk no-graph）、
-`results/infinilm_..._0824_005308.json`（64blk graph）。
-
-### v2 结论
-
-1. **num_blocks 是一阶变量**。只改 512→64，w1/w2/w3/w4 全部从"2.8×~52×
-   落后"变成与 vLLM 持平（graph 下 w1/w4 还略快）。v1 的四条假设
-   （launch 开销、prefill 路径、批处理串行、decode 随长度劣化）全部不成立
-   或降级为次要因素。
-2. **CUDA graph 真实收益约 10%**：同 64blk 口径，w1 11.9→10.7 ms/tok、
-   w4 12.3→11.1 ms/tok、w3 +7%、w2 -5%。值得开，但不是量级差距。
-3. **默认 num_blocks=512 在小显存卡上是陷阱**：cache 按 13 万 token 预占满
-   卡，剩余空间不足导致全负载 3~50× 劣化，且无任何告警/日志。机制待
-   profile 确认（疑似近满显存下分配/驱动慢路径，或 engine 内与 block 数
-   相关的 per-step 开销）。这本身可立项：cache 容量自适应/告警。
-4. 64blk 口径下 InfiniLM 与 vLLM 已持平，说明 1.7B 规模 kernel 与调度
-   没有本质差距；原计划"找大差距"在消费卡小模型上不成立，立项方向应转向
-   (a) cache 预分配策略缺陷修复，(b) 更大模型/更高并发下重新找差距。
-
-### 待办
-
-- [ ] 膝点定位：num_blocks ∈ {128, 256, 384} 各跑一轮，找到劣化拐点
-      （256 峰值约 12GB，需 GPU 较空窗口）。
-- [ ] nsys 对比 512blk vs 64blk 的 w1，确认劣化机制（kernel 变慢还是
-      每步多了主机侧/分配开销）。
-- [ ] 换 8B 级模型（本地已有 Qwen3-4B；Qwen3-8B-FP8 下载中）在 64blk
-      口径下复测，检验"持平"结论在大模型上是否仍成立。
-- [ ] 若转向 cache 预分配立项：先读 paged cache 分配路径
-      （`llm.py` num_blocks → engine paged cache），确认 512 劣化的代码机制。
-
 ---
 
-## v1（2026-08-23/24，已被 v2 推翻，存档保留）
+## v1 存档（2026-08-23/24，已被推翻）
 
 数据：`results/infinilm_..._0823_235223.json`、`results/vllm_..._0824_002522.json`。
 配置：InfiniLM no-graph、paged-attn、prefix caching on、**num_blocks=512**；
@@ -67,17 +112,15 @@ vLLM v1 默认（CUDA graph on、prefix caching on）、gpu_memory_utilization=0
 | w3 batch32 × 128 tok | 42.0 tok/s | 2166.0 tok/s | 52× |
 | w4 长 decode 1024 tok | 47.9 ms/tok（20.9 tok/s） | 12.2 ms/tok（82.3 tok/s） | 3.9× |
 
-v1 归因假设（对照 v2 数据后的判决）：
+v1 归因假设与判决：
 
-1. ~~单请求 decode 低是缺 CUDA graph 的 launch 开销~~ —— **推翻**：
-   no-graph 64blk 已达 11.9 ms/tok，graph 只再提速 ~10%。
-2. ~~w2 是 prefill 路径异常（纯 prefill 估算差距 ~75×）~~ —— **推翻**：
+1. ~~单请求 decode 低是缺 CUDA graph 的 launch 开销~~ —— 推翻：no-graph
+   64blk 已达 11.9 ms/tok，graph 只再提速 ~10%。
+2. ~~w2 是 prefill 路径异常（纯 prefill 估算差距 ~75×）~~ —— 推翻：
    64blk 下 w2 e2e 2.7s，与 vLLM 同量级。
-3. ~~w3 批处理存在 per-request 串行开销~~ —— **推翻**：64blk 下 w3
-   1995~2136 tok/s，扩展性正常。
-4. ~~w4 decode 随上下文长度劣化~~ —— **推翻**：64blk 下 w4 与 w1 基本持平。
-
-v1 的全部四条差距都是 num_blocks=512 预占满卡引发的系统性劣化的表现。
+3. ~~w3 批处理存在 per-request 串行开销~~ —— 推翻：64blk 下 w3
+   1850~2136 tok/s，扩展性正常。
+4. ~~w4 decode 随上下文长度劣化~~ —— 推翻：64blk 下 w4 与 w1 持平。
 
 ## 立项书模板（方向定稿后填写）
 

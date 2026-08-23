@@ -81,7 +81,7 @@ def build_engine(args):
         llm = LLM(
             model=args.model,
             dtype="bfloat16",
-            gpu_memory_utilization=0.85,
+            gpu_memory_utilization=args.gpu_mem_util,
             max_model_len=4096,
             seed=0,
         )
@@ -101,7 +101,7 @@ def build_engine(args):
             except Exception:
                 pass
 
-        engine_notes = {"engine": "vllm", "cuda_graph": True, "prefix_caching": True}
+        engine_notes = {"engine": "vllm", "cuda_graph": True, "prefix_caching": True, "gpu_memory_utilization": args.gpu_mem_util}
 
     else:
         raise ValueError(f"unknown engine: {args.engine}")
@@ -127,6 +127,12 @@ def main():
         type=int,
         default=512,
         help="infinilm only: paged KV cache blocks (x256 tokens); lower it for a low-VRAM run",
+    )
+    parser.add_argument(
+        "--gpu-mem-util",
+        type=float,
+        default=0.85,
+        help="vllm only: gpu_memory_utilization; lower it to stay under VRAM watchdogs",
     )
     args = parser.parse_args()
 
