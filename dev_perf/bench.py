@@ -17,17 +17,34 @@ enable_graph=False + prefix caching on. Both facts are recorded in the output.
 import argparse
 import json
 import os
+import sys
 import time
 
 from workload import WORKLOADS, MemSampler, resolve_model_path
 
 MAIN_CHECKOUT_PYTHON = "/home/yyy/src/InfiniLM/python"
+LIB_DIRS = [
+    "/home/yyy/src/InfiniCore/python/infinicore/lib",
+    "/home/yyy/src/InfiniLM/python/infinilm/lib",
+]
+
+
+def ensure_ld_library_path():
+    """infinilm/infinicore extensions find their .so deps via LD_LIBRARY_PATH.
+
+    Re-exec the interpreter with the env set if needed (the dynamic linker
+    reads LD_LIBRARY_PATH only at process start).
+    """
+    cur = os.environ.get("LD_LIBRARY_PATH", "")
+    if all(d in cur.split(":") for d in LIB_DIRS):
+        return
+    os.environ["LD_LIBRARY_PATH"] = ":".join(LIB_DIRS + ([cur] if cur else []))
+    os.execv(sys.executable, [sys.executable] + sys.argv)
 
 
 def build_engine(args):
     if args.engine == "infinilm":
-        import sys
-
+        ensure_ld_library_path()
         sys.path.insert(0, MAIN_CHECKOUT_PYTHON)
         from infinilm.llm.llm import LLM
         from infinilm.llm.sampling_params import SamplingParams
