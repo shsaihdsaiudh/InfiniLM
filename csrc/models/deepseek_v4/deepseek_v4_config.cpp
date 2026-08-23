@@ -74,9 +74,11 @@ create_deepseek_v4_model_config(
         || config.value("hc_sinkhorn_iters", 0UL) == 0) {
         throw std::runtime_error("DeepSeek-V4: invalid mHC configuration");
     }
-    if (config.value("expert_dtype", std::string{}) != "fp4") {
+    const std::string expert_dtype =
+        config.value("expert_dtype", std::string{"dense"});
+    if (expert_dtype != "fp4" && expert_dtype != "dense") {
         throw std::runtime_error(
-            "DeepSeek-V4: the initial InfiniLM path requires FP4 routed experts");
+            "DeepSeek-V4: expert_dtype must be fp4 or dense");
     }
 
     if (config.contains("layer_types")) {
@@ -111,6 +113,15 @@ create_deepseek_v4_model_config(
     }
 
     config["num_experts"] = num_experts;
+    config["expert_dtype"] = expert_dtype;
+    config["n_shared_experts"] =
+        config.value("n_shared_experts", 1UL);
+    config["scoring_func"] =
+        config.value("scoring_func", std::string{"sqrtsoftplus"});
+    config["norm_topk_prob"] = config.value("norm_topk_prob", true);
+    config["routed_scaling_factor"] =
+        config.value("routed_scaling_factor", 1.5);
+    config["swiglu_limit"] = config.value("swiglu_limit", 10.0);
     config["partial_rotary_factor"] =
         static_cast<double>(rotary_dim) / static_cast<double>(head_dim);
     config["mlp_bias"] = false;

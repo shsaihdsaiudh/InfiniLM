@@ -334,3 +334,25 @@ CUDA Graph 路径需换成设备侧 mask/scatter，并进一步接现有 DSA spa
 
 下一步把三种 attention 路径和各自 state 接入 decoder/model 层调度，然后完成
 包含 mHC 与混合层型的 InfiniLM tiny 模型端到端对拍。
+
+---
+
+## 验证笔记 #9：标准 MoE 与 Hash-MoE（2026-08-24）
+
+新增 `DeepseekV4SparseMoeBlock` correctness path，覆盖：
+
+- `sqrtsoftplus` router score、correction-bias top-k、选中专家概率归一化与
+  `routed_scaling_factor`；
+- 前 `num_hash_layers` 层使用冻结 `tid2eid[input_ids]` 选择专家，同时继续使用
+  learned router score 计算混合权重；
+- routed experts、共享专家和 V4 限幅 SwiGLU；
+- tiny dense expert 参数布局，以及真实 checkpoint 的逐专家 MXFP4 packed 参数布局；
+- packed 路径接入现有 `fused_moe_mxfp4`（V4 限幅融合仍作为后续 InfiniCore 缺口）。
+
+native smoke 对标准和 Hash 两条路由分别与独立 CPU 公式对拍：
+
+- FP32 最大绝对误差：`3.72529e-9` / `1.49012e-8`；
+- BF16 最大绝对误差：`2.75731e-4` / `3.94031e-4`。
+
+`_infinilm` 全量 C++ 扩展构建通过。下一步将 mHC、混合 attention 和 MoE 接入
+decoder/model，完成官方 tiny state dict 的整模型 prefill/decode 对拍。
