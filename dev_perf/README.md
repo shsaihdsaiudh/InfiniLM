@@ -21,11 +21,20 @@
 
 结果 JSON 写入 `dev_perf/results/`。
 
-低显存模式（显存紧张时用）：InfiniLM 侧加 `--num-blocks 64` 可把 paged cache
-预分配从 ~13GB 降到 ~1.8GB（Qwen3-1.7B 口径），w1-w4 负载矩阵在 16k token
-容量内仍可完整运行；num_blocks 会记入结果 JSON。
-注意：num_blocks 对性能有一阶影响——512 在 16GB 卡上会把显存占满并导致
-全负载严重劣化（见 gap_analysis.md v2），跨轮次对比必须用相同 num_blocks。
+InfiniLM 侧常用参数：
+
+- `--num-blocks 64`：低显存模式。paged cache 预分配从 ~13GB 降到 ~1.8GB
+  （Qwen3-1.7B 口径），w1-w4 在 16k token 容量内仍可完整运行；num_blocks
+  会记入结果 JSON。注意 num_blocks 对性能有一阶影响——512 在 16GB 卡上会
+  把显存占满并导致全负载严重劣化（见 gap_analysis.md v3），跨轮次对比必须
+  用相同 num_blocks。
+- `--attn-backend flash-attn`：prefill/decode 改用 FlashAttention-2（需
+  ATen+FA 版 InfiniCore，见 gap_analysis.md v4 的构建与 `INFINI_ROOT`
+  用法）。长 prefill 负载收益 ~20~30%。
+- `--only w2_long_prefill`：只跑指定负载（逗号分隔）。
+- `--dump-outputs`：把每个请求的输出 token ids 记入 JSON，配合
+  `compare_outputs.py a.json b.json ...` 做跨引擎/跨 backend 的贪心解码
+  逐 token 对拍（exact match 数 + 最早分叉位置）。
 
 ## 负载矩阵
 
@@ -46,4 +55,5 @@
 
 差距清单（哪个负载、差多少、可能原因）→ 据此决定 #2 是否转正立项，以及立项的可度量目标。
 
-v1 已产出：见 `dev_perf/gap_analysis.md`（含对比表、归因假设、待补数据清单和立项书模板）。
+最新进展见 `dev_perf/gap_analysis.md`（v4：flash-attn 接入落地，prefill
+差距收敛到 ~1.05~1.3×；含对比表、归因、复现命令和立项书模板）。

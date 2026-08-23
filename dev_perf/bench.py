@@ -23,10 +23,28 @@ import time
 from workload import WORKLOADS, MemSampler, resolve_model_path
 
 MAIN_CHECKOUT_PYTHON = "/home/yyy/src/InfiniLM/python"
+# INFINI_ROOT selects the InfiniCore install (e.g. ~/.infini-dsv4 for the
+# ATen-enabled build, required by the flash-attn backend); defaults to the
+# non-ATen copy in the InfiniCore python package dir.
+_INFINI_CORE_LIB = (
+    os.path.join(os.environ["INFINI_ROOT"], "lib")
+    if os.environ.get("INFINI_ROOT")
+    else "/home/yyy/src/InfiniCore/python/infinicore/lib"
+)
+def _torch_lib_dir():
+    """site-packages/torch/lib, needed on LD_LIBRARY_PATH for ATen-enabled
+    InfiniCore builds (they link libtorch)."""
+    for p in sys.path:
+        d = os.path.join(p, "torch", "lib")
+        if os.path.isdir(d):
+            return d
+    return None
+
+
 LIB_DIRS = [
-    "/home/yyy/src/InfiniCore/python/infinicore/lib",
+    _INFINI_CORE_LIB,
     "/home/yyy/src/InfiniLM/python/infinilm/lib",
-]
+] + ([_torch_lib_dir()] if _torch_lib_dir() else [])
 
 
 def ensure_ld_library_path():
@@ -54,7 +72,7 @@ def build_engine(args):
             device="cuda",
             dtype="bfloat16",
             cache_type="paged",
-            attn_backend="paged-attn",
+            attn_backend=args.attn_backend,
             max_batch_size=64,
             num_blocks=args.num_blocks,
             enable_prefix_caching=True,
@@ -73,7 +91,7 @@ def build_engine(args):
         def close():
             llm.close()
 
-        engine_notes = {"engine": "infinilm", "cuda_graph": bool(args.enable_graph), "prefix_caching": True, "attn_backend": "paged-attn", "num_blocks": args.num_blocks}
+        engine_notes = {"engine": "infinilm", "cuda_graph": bool(args.enable_graph), "prefix_caching": True, "attn_backend": args.attn_backend, "num_blocks": args.num_blocks}
 
     elif args.engine == "vllm":
         from vllm import LLM, SamplingParams
@@ -139,6 +157,17 @@ def main():
         default=None,
         help="comma-separated workload names to run (default: all four)",
     )
+    parser.add_argument(
+        "--attn-backend",
+        default="paged-attn",
+        choices=["default", "static-attn", "paged-attn", "flash-attn", "flashinfer"],
+        help="infinilm only: attention backend",
+    )
+    parser.add_argument(
+        "--dump-outputs",
+        action="store_true",
+        help="record per-request output token ids in the JSON (for cross-engine correctness diffing)",
+    )
     args = parser.parse_args()
 
     # WSL2: vLLM disables pinned memory by default, which makes its V2 model
@@ -185,6 +214,8 @@ def main():
             "min_output_tokens": min(out_token_counts),
             "max_output_tokens": max(out_token_counts),
         }
+        if args.dump_outputs:
+            rec["output_token_ids"] = [list(o.outputs[0].token_ids) for o in outputs]
         results.append(rec)
         print(
             f"[bench] {name}: e2e={e2e:.2f}s out={total_out} tok "

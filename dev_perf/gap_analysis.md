@@ -1,7 +1,68 @@
 # 项目 #2 基线差距清单
 
-最新结论见 v3（2026-08-24）：劣化是显存 98% 极端饱和处的悬崖，不是随
-num_blocks 渐变；64~320 blocks 区间 InfiniLM 与 vLLM 持平，graph 再赚 ~10%。
+最新结论见 v4（2026-08-24）：B 方向落地——InfiniLM 接入 FlashAttention-2
+后，长 prefill 差距从 1.5~1.9× 收敛到 ~1.05~1.3×，输出与 paged-attn/vLLM
+逐 token 一致。
+
+---
+
+## v4（2026-08-24）：B 方向落地 —— prefill 接 FlashAttention-2
+
+按 v3 末尾的 kernel 定位（自研 `PagedAttentionPrefill` 比 FA2 慢 13.5×），
+走"直接调 FA2"路线：重建 InfiniCore（`aten=y` +
+`--flash-attn=<FA repo>`，FA 取 **v2.7.4.post1**，其 `mha_varlen_fwd` /
+`mha_fwd_kvcache` 与 InfiniCore `flash_attention_adaptor.hpp` 逐参数匹配，
+原生支持 paged block_table），装到 `~/.infini-fa`；InfiniLM 侧用已有的
+`FlashAttentionImpl`（`--attn-backend flash-attn`：prefill 走
+`flash::mha_varlen_fwd`，decode 走 `flash::mha_fwd_kvcache`）。
+
+同机同批对照（Qwen3-1.7B，64blk，no-graph；paged 与 flash 跑在同一个
+FA 版 InfiniCore 库上，对照干净）：
+
+| 负载 | paged-attn | flash-attn | vLLM（0.85 档） |
+|---|---|---|---|
+| w1 单请求 decode | 10.86 ms/tok | 11.62 ms/tok | 8.95 ms/tok |
+| w2 长 prefill + 128 decode | 2.48s | **2.14s**（单跑复测 1.95s） | 1.50s |
+| w3 batch32 总吞吐 | 2191 tok/s | 2127 tok/s | 2957 tok/s |
+| w4 长 decode | 11.07 ms/tok | 11.16 ms/tok | 9.71 ms/tok |
+
+Qwen3-4B（64blk，no-graph）w2：paged 5.41s → flash **4.04s**（-25%），
+vLLM 参考值 3.84s → 差距收敛到 ~1.05×。
+
+正确性（贪心解码逐 token 对拍，`compare_outputs.py`）：
+
+- **w2（FA varlen paged 路径压力最大的负载）输出与 paged-attn 完全一致，
+  也与 vLLM 完全一致**——1.7B、4B 均如此。
+- 其余负载的分叉率与 vLLM-vs-paged 的分叉率同量级（w3：24/32 vs 23/32
+  exact；w4：两家同在一处 late-token 分叉；目检文本均连贯）——属 bf16
+  规约顺序差异，非功能错误。
+
+结论：
+
+1. **prefill 主差距已被 FA2 消化**：w2 e2e 1.7B -14~30%、4B -25%；4B 上
+   与 vLLM 基本持平（1.05×）。与 v3 预测（attention 491ms→~36ms）吻合。
+2. 剩余差距（1.7B w2 flash 2.14s vs vLLM 1.50s）主要在：未融合
+   elementwise 链（~137ms/prefill）与 decode 段（~10%），即 v3 已列的
+   第二优化项。
+3. 注意：vLLM 0.85 档本次实测峰值 15.9GB，贴 97% 看门狗线，复测建议
+   0.72~0.8 档。
+
+复现：
+
+```bash
+# 一次性：重建 InfiniCore（约 28min，FA 84 个 .cu 全量编译）
+cd /home/yyy/src/InfiniCore   # flash-attention repo 在 /home/yyy/src/flash-attention @ v2.7.4.post1
+xmake f -c --aten=y --flash-attn=/home/yyy/src/flash-attention --graph=y \
+  --cudnn=n --ccl=n --nv-gpu=y --cpu=y --omp=y \
+  --cuda=$HOME/.local/cuda-13.2 --cuda_arch=sm_120 -m release -k shared
+xmake build -j6 && xmake install -o ~/.infini-fa
+
+# 运行（INFINI_ROOT 指向 FA 版库，勿覆盖 V4 线在用的 ~/.infini-dsv4）
+INFINI_ROOT=$HOME/.infini-fa HF_HUB_OFFLINE=1 \
+  /home/yyy/src/InfiniLM/.venv/bin/python dev_perf/bench.py \
+  --engine infinilm --model Qwen/Qwen3-1.7B --num-blocks 64 \
+  --attn-backend flash-attn --dump-outputs
+```
 
 ---
 
@@ -103,10 +164,13 @@ elementwise 链未融合。这是边界清晰、可度量的 kernel 优化目标
 ### 待办
 
 - [ ] （需看门狗临时放宽）nsys 抓 512blk 的 w1，直接观察 98% 悬崖机制。
-- [ ] prefill attention kernel 优化立项：先读 InfiniCore `paged_attention`
-      prefill 实现与 `flash_attention` 算子接口，确认是直接调 FA 还是手写；
-      目标"prefill attention 每层 19ms → ≤2ms（1.7B/3240tok/hd128）"。
-- [ ] （可选）elementwise 融合（rmsnorm/rope/swiglu）作为第二优化项。
+- [x] ~~prefill attention kernel 优化立项~~ —— 已由 v4 完成：接 FA2
+      （`--attn-backend flash-attn` + FA 版 InfiniCore），w2 的 prefill 段
+      差距收敛到 ~1.05~1.3×，正确性逐 token 对拍通过。
+- [ ] （可选）elementwise 融合（rmsnorm/rope/swiglu）作为第二优化项——
+      v4 后它已成为 w2 剩余差距的第一来源（~137ms/prefill，1.7B 口径）。
+- [ ] （可选）flash-attn 设为默认 attention backend 的评估：需在更多模型
+      上补正确性对拍，并确认 FP8/滑窗/softcap 模型的回退路径。
 - [ ] Qwen3-8B-FP8 下载完成后，可作为 8B 级 + FP8 口径的复测对象。
 
 ---
