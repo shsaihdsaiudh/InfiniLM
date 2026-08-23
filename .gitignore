@@ -24,6 +24,7 @@ __pycache__/
 
 # JSON
 *.json
+!dev_perf/results/*.json
 
 #GGUF
 *.gguf

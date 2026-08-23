@@ -22,8 +22,10 @@
 结果 JSON 写入 `dev_perf/results/`。
 
 低显存模式（显存紧张时用）：InfiniLM 侧加 `--num-blocks 64` 可把 paged cache
-预分配从 ~13GB 降到 ~1.6GB（Qwen3-1.7B 口径），w1-w4 负载矩阵在 16k token
+预分配从 ~13GB 降到 ~1.8GB（Qwen3-1.7B 口径），w1-w4 负载矩阵在 16k token
 容量内仍可完整运行；num_blocks 会记入结果 JSON。
+注意：num_blocks 对性能有一阶影响——512 在 16GB 卡上会把显存占满并导致
+全负载严重劣化（见 gap_analysis.md v2），跨轮次对比必须用相同 num_blocks。
 
 ## 负载矩阵
 
