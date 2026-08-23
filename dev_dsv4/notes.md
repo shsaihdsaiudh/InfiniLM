@@ -133,3 +133,44 @@ xmake build -y -j8 _infinilm
 2026-08-23 本地复验结果：loader `3 passed`；tiny baseline 的 sliding、CSA、
 HCA 和 mixed 四种分层增量路径最大绝对误差均不超过 `1.1e-6`；C++ 扩展增量
 构建通过。
+
+---
+
+## 验证笔记 #3：mHC 原生组合路径（2026-08-23）
+
+新增 `DeepseekV4HyperConnection` 和 `DeepseekV4HyperHead`，使用 InfiniCore
+基础算子实现：
+
+- unweighted RMSNorm 后执行 FP32 mapping projection；
+- `pre/post/comb` 的 sigmoid、softmax 和 epsilon 语义；
+- 与官方一致的 Sinkhorn 顺序：首次 column normalize，之后交替 row/column；
+- `comb.T @ hidden_streams` 的有向残差混合；
+- 最终 HyperHead 四流 collapse。
+
+`dev_dsv4/mhc_native_smoke.cpp` 含独立 CPU 参考公式，并在 RTX 5060 Ti 上与
+原生 CUDA 路径逐元素对拍。FP32 最大绝对误差：
+
+- `post=1.75238e-5`，`comb=3.44217e-5`；
+- `collapsed=1.02520e-5`，`apply=2.02060e-5`；
+- `head=8.94070e-8`。
+
+ATen-enabled InfiniCore 下的 BF16 输入最大绝对误差：
+
+- `collapsed=0.00318474`；
+- `apply=0.00489402`；
+- `head=0.00493288`。
+
+复现：
+
+```bash
+# 当前非 ATen 构建：验证 FP32 组合路径
+dev_dsv4/run_mhc_native_smoke.sh
+
+# ATen-enabled InfiniCore：同时验证 BF16 ↔ FP32 cast 路径
+INFINI_ROOT=/path/to/infinicore-aten dev_dsv4/run_mhc_native_smoke.sh
+```
+
+验证同时确认两个 InfiniCore 约束：通用 elementwise 算子不会隐式 broadcast，
+所有 scale/base/epsilon 必须先显式 `broadcast_to`；`cast_` 在 `aten=false`
+构建中不可用。V4 正式运行环境因此需要 `aten=true`，除非后续在 InfiniCore
+补一个不依赖 ATen 的原生 dtype cast。
