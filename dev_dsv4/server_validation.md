@@ -31,7 +31,7 @@ InfiniLM 与 InfiniCore 应保持同级目录，并使用本分支已提交的�
 ```bash
 git clone <InfiniCore repository URL> InfiniCore
 git clone <InfiniLM repository URL> InfiniLM
-git -C InfiniCore checkout dev/fp8-blockwise-dequantize
+git -C InfiniCore checkout feat/mxfp4-clamped-swiglu
 git -C InfiniLM checkout dev/deepseek-v4
 ```
 
