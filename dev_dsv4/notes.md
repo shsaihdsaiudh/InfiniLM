@@ -216,3 +216,29 @@ INFINI_ROOT="$HOME/.infini-dsv4" dev_dsv4/run_attention_native_smoke.sh
 
 下一步是在该核心上加入 sliding-window KV cache 与 prefill/decode 增量对拍，
 再接 CSA/HCA compressor 和 Lightning Indexer。
+
+---
+
+## 验证笔记 #5：sliding-window KV cache（2026-08-23）
+
+`DeepseekV4Attention::forward_sliding` 已实现显式共享-KV cache：
+
+- cache 布局为 `[batch, retained_sequence, 1, head_dim]`；
+- 每次调用将历史 cache 与当前 chunk 的 RoPE-applied KV 临时拼接；
+- causal mask 同时限制未来 token 和滑窗左边界；
+- attention sink 不受滑窗 mask 影响，始终作为额外 softmax logit；
+- 返回前只保留最后 `sliding_window - 1` 个 KV，与 Transformers
+  `DynamicSlidingWindowLayer` 一致；
+- 同一实现支持整段 prefill 和逐 token decode。
+
+native smoke 使用 `sliding_window=2`、序列长度 3，明确跨越窗口边界，并与
+独立 CPU 参考公式及逐 token 路径对拍。最大绝对误差：
+
+- FP32：`weights=0.000769794`、`output=0.000119483`、
+  `prefill/decode=0.000119466`；
+- BF16：`weights=0.0131521`、`output=0.00126566`、
+  `prefill/decode=0`。
+
+全量 InfiniLM C++ 构建、loader `3 passed`、四种官方 tiny 增量基线和 mHC
+FP32/BF16 smoke 均再次通过。下一步转入 HCA compressor；它比 CSA 少一个
+Lightning Indexer 分支，适合作为压缩注意力的第一条落地路径。

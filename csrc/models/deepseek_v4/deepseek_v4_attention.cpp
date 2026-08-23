@@ -11,6 +11,7 @@
 #include <infinicore/ops/rms_norm.hpp>
 #include <infinicore/ops/softmax.hpp>
 
+#include <algorithm>
 #include <cmath>
 #include <limits>
 #include <optional>
@@ -329,19 +330,34 @@ infinicore::Tensor DeepseekV4Attention::apply_partial_rope_(
 }
 
 infinicore::Tensor DeepseekV4Attention::causal_bias_(
-    size_t sequence_length,
+    size_t query_length,
+    size_t kv_length,
+    size_t past_length,
+    size_t sliding_window,
     const infinicore::DataType &dtype,
     const infinicore::Device &device) const {
-    std::vector<float> values(sequence_length * sequence_length, 0.0f);
-    for (size_t query = 0; query < sequence_length; ++query) {
-        for (size_t key = query + 1; key < sequence_length; ++key) {
-            values[query * sequence_length + key] =
-                -std::numeric_limits<float>::infinity();
+    if (kv_length != past_length + query_length) {
+        throw std::runtime_error(
+            "DeepSeek-V4 attention KV length does not match past + query");
+    }
+    std::vector<float> values(query_length * kv_length, 0.0f);
+    for (size_t query = 0; query < query_length; ++query) {
+        const size_t query_kv_index = past_length + query;
+        const size_t first_visible = sliding_window == 0
+            ? 0
+            : (query_kv_index + 1 > sliding_window
+                   ? query_kv_index + 1 - sliding_window
+                   : 0);
+        for (size_t key = 0; key < kv_length; ++key) {
+            if (key > query_kv_index || key < first_visible) {
+                values[query * kv_length + key] =
+                    -std::numeric_limits<float>::infinity();
+            }
         }
     }
     auto cpu = infinicore::Tensor::from_blob(
         values.data(),
-        {1, 1, sequence_length, sequence_length},
+        {1, 1, query_length, kv_length},
         infinicore::DataType::F32,
         infinicore::Device::cpu());
     return cast_to(cpu->to(device), dtype);
@@ -353,17 +369,83 @@ DeepseekV4AttentionOutput DeepseekV4Attention::forward(
     const infinicore::Tensor &sin) const {
     validate_input(
         hidden_states, cos, sin, hidden_size_, rope_head_dim_);
-    const size_t batch_size = hidden_states->size(0);
-    const size_t sequence_length = hidden_states->size(1);
-
     auto projections = project_qkv(hidden_states, cos, sin);
-    auto query = projections.query;
-    auto kv = projections.kv;
+    return attention_from_projections_(
+        projections.query, projections.kv, cos, sin, 0, 0);
+}
+
+DeepseekV4SlidingAttentionOutput DeepseekV4Attention::forward_sliding(
+    const infinicore::Tensor &hidden_states,
+    const infinicore::Tensor &cos,
+    const infinicore::Tensor &sin,
+    const std::optional<infinicore::Tensor> &past_kv,
+    size_t sliding_window) const {
+    if (sliding_window < 2) {
+        throw std::runtime_error(
+            "DeepSeek-V4 sliding attention requires sliding_window >= 2");
+    }
+    auto projections = project_qkv(hidden_states, cos, sin);
+    const size_t batch_size = hidden_states->size(0);
+    size_t past_length = 0;
+    auto combined_kv = projections.kv;
+    if (past_kv.has_value()) {
+        const auto &past = past_kv.value();
+        if (!past || past->ndim() != 4
+            || past->size(0) != batch_size || past->size(2) != 1
+            || past->size(3) != head_dim_
+            || past->dtype() != projections.kv->dtype()
+            || past->device() != projections.kv->device()
+            || past->size(1) > sliding_window - 1) {
+            throw std::runtime_error(
+                "DeepSeek-V4 sliding attention received an incompatible KV cache");
+        }
+        past_length = past->size(1);
+        combined_kv = infinicore::op::cat(
+            {past, projections.kv}, 1);
+    }
+
+    auto attention = attention_from_projections_(
+        projections.query,
+        combined_kv,
+        cos,
+        sin,
+        past_length,
+        sliding_window);
+    const size_t combined_length = combined_kv->size(1);
+    const size_t retained_length = std::min(
+        combined_length, sliding_window - 1);
+    auto next_cache = combined_kv
+                          ->narrow({{1,
+                                    combined_length - retained_length,
+                                    retained_length}})
+                          ->contiguous();
+    return {attention.output, attention.attention_weights, next_cache};
+}
+
+DeepseekV4AttentionOutput DeepseekV4Attention::attention_from_projections_(
+    const infinicore::Tensor &query,
+    const infinicore::Tensor &kv,
+    const infinicore::Tensor &cos,
+    const infinicore::Tensor &sin,
+    size_t past_length,
+    size_t sliding_window) const {
+    if (!query || !kv || query->ndim() != 4 || kv->ndim() != 4
+        || query->size(0) != kv->size(0)
+        || query->size(2) != num_attention_heads_
+        || query->size(3) != head_dim_ || kv->size(2) != 1
+        || kv->size(3) != head_dim_
+        || kv->size(1) != past_length + query->size(1)) {
+        throw std::runtime_error(
+            "DeepSeek-V4 attention projection shapes are incompatible");
+    }
+    const size_t batch_size = query->size(0);
+    const size_t query_length = query->size(1);
+    const size_t kv_length = kv->size(1);
 
     auto query_for_scores = query->permute({0, 2, 1, 3})
                                 ->contiguous()
                                 ->view({batch_size,
-                                        num_attention_heads_ * sequence_length,
+                                        num_attention_heads_ * query_length,
                                         head_dim_});
     auto kv_shared = kv->squeeze(2)->contiguous();
     auto scores = infinicore::op::matmul(
@@ -372,33 +454,39 @@ DeepseekV4AttentionOutput DeepseekV4Attention::forward(
                       1.0f / std::sqrt(static_cast<float>(head_dim_)))
                       ->view({batch_size,
                               num_attention_heads_,
-                              sequence_length,
-                              sequence_length});
+                              query_length,
+                              kv_length});
     scores = add_broadcast(
         scores,
-        causal_bias_(sequence_length, scores->dtype(), scores->device()),
+        causal_bias_(
+            query_length,
+            kv_length,
+            past_length,
+            sliding_window,
+            scores->dtype(),
+            scores->device()),
         scores->shape());
 
     auto sink = static_cast<infinicore::Tensor>(sinks_)
                     ->view({1, num_attention_heads_, 1, 1});
     sink = broadcast_to_shape(
         sink,
-        {batch_size, num_attention_heads_, sequence_length, 1});
+        {batch_size, num_attention_heads_, query_length, 1});
     auto combined_logits = infinicore::op::cat({scores, sink}, 3);
     auto probabilities = infinicore::op::softmax(combined_logits, -1);
     auto attention_weights = probabilities
-                                 ->narrow({{3, 0, sequence_length}})
+                                 ->narrow({{3, 0, kv_length}})
                                  ->contiguous();
 
     auto attention_output = infinicore::op::matmul(
                                 attention_weights->view(
                                     {batch_size,
-                                     num_attention_heads_ * sequence_length,
-                                     sequence_length}),
+                                     num_attention_heads_ * query_length,
+                                     kv_length}),
                                 kv_shared)
                                 ->view({batch_size,
                                         num_attention_heads_,
-                                        sequence_length,
+                                        query_length,
                                         head_dim_})
                                 ->permute({0, 2, 1, 3})
                                 ->contiguous();
@@ -407,12 +495,12 @@ DeepseekV4AttentionOutput DeepseekV4Attention::forward(
 
     auto grouped = attention_output->view(
         {batch_size,
-         sequence_length,
+         query_length,
          o_groups_,
          num_attention_heads_ * head_dim_ / o_groups_});
     grouped = o_a_proj_->forward(grouped)
                   ->view({batch_size,
-                          sequence_length,
+                          query_length,
                           o_groups_ * o_lora_rank_});
     auto output = o_b_proj_->forward(grouped);
     return {output, attention_weights};

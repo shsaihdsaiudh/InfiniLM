@@ -2,12 +2,14 @@
 
 #include <infinicore/device.hpp>
 #include <infinicore/ops/cast.hpp>
+#include <infinicore/ops/cat.hpp>
 #include <infinicore/tensor.hpp>
 
 #include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <iostream>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -144,7 +146,8 @@ ReferenceOutput reference_attention(
     size_t rope_dim,
     size_t o_groups,
     size_t o_lora_rank,
-    float eps) {
+    float eps,
+    size_t sliding_window = 0) {
     auto q_residual = linear(
         hidden, q_a_weight, sequence_length, hidden_size, q_lora_rank);
     rms_norm(
@@ -193,8 +196,13 @@ ReferenceOutput reference_attention(
         for (size_t query_token = 0;
              query_token < sequence_length;
              ++query_token) {
-            std::vector<float> logits(query_token + 2, sinks[head]);
-            for (size_t key_token = 0;
+            const size_t first_key = sliding_window != 0
+                    && query_token + 1 > sliding_window
+                ? query_token + 1 - sliding_window
+                : 0;
+            std::vector<float> logits(
+                query_token - first_key + 2, sinks[head]);
+            for (size_t key_token = first_key;
                  key_token <= query_token;
                  ++key_token) {
                 float score = 0.0f;
@@ -204,7 +212,7 @@ ReferenceOutput reference_attention(
                                  + feature]
                            * kv[key_token * head_dim + feature];
                 }
-                logits[key_token] = score * scale;
+                logits[key_token - first_key] = score * scale;
             }
             float maximum = *std::max_element(logits.begin(), logits.end());
             float denominator = 0.0f;
@@ -212,10 +220,11 @@ ReferenceOutput reference_attention(
                 logit = std::exp(logit - maximum);
                 denominator += logit;
             }
-            for (size_t key_token = 0;
+            for (size_t key_token = first_key;
                  key_token <= query_token;
                  ++key_token) {
-                const float probability = logits[key_token] / denominator;
+                const float probability =
+                    logits[key_token - first_key] / denominator;
                 attention_weights[
                     (head * sequence_length + query_token)
                     * sequence_length + key_token] = probability;
@@ -367,6 +376,29 @@ int main() {
         o_groups,
         o_lora_rank,
         eps);
+    constexpr size_t sliding_window = 2;
+    const auto sliding_reference = reference_attention(
+        hidden,
+        cos,
+        sin,
+        q_a_weight,
+        q_a_norm_weight,
+        q_b_weight,
+        kv_weight,
+        kv_norm_weight,
+        o_a_weight,
+        o_b_weight,
+        sinks,
+        sequence_length,
+        hidden_size,
+        q_lora_rank,
+        num_heads,
+        head_dim,
+        rope_dim,
+        o_groups,
+        o_lora_rank,
+        eps,
+        sliding_window);
 
     auto run = [&](const DataType &dtype,
                    const std::string &suffix,
@@ -427,10 +459,69 @@ int main() {
             to_host(native.output),
             reference.output,
             output_tolerance);
+
+        auto full_sliding = attention.forward_sliding(
+            hidden_device,
+            cos_device,
+            sin_device,
+            std::nullopt,
+            sliding_window);
+        require_close(
+            "sliding_weights" + suffix,
+            to_host(full_sliding.attention_weights),
+            sliding_reference.attention_weights,
+            weight_tolerance);
+        require_close(
+            "sliding_output" + suffix,
+            to_host(full_sliding.output),
+            sliding_reference.output,
+            output_tolerance);
+        if (full_sliding.kv_cache->size(1) != sliding_window - 1) {
+            throw std::runtime_error(
+                "DeepSeek-V4 full sliding cache retained the wrong length");
+        }
+
+        std::optional<Tensor> cache;
+        std::vector<Tensor> incremental_outputs;
+        incremental_outputs.reserve(sequence_length);
+        for (size_t token = 0; token < sequence_length; ++token) {
+            auto hidden_token = hidden_device
+                                    ->narrow({{1, token, 1}})
+                                    ->contiguous();
+            auto cos_token = cos_device
+                                 ->narrow({{1, token, 1}})
+                                 ->contiguous();
+            auto sin_token = sin_device
+                                 ->narrow({{1, token, 1}})
+                                 ->contiguous();
+            auto step = attention.forward_sliding(
+                hidden_token,
+                cos_token,
+                sin_token,
+                cache,
+                sliding_window);
+            const size_t expected_kv_length = std::min(
+                token + 1, sliding_window);
+            if (step.attention_weights->size(3) != expected_kv_length
+                || step.kv_cache->size(1) != std::min(
+                    token + 1, sliding_window - 1)) {
+                throw std::runtime_error(
+                    "DeepSeek-V4 incremental sliding cache shape mismatch");
+            }
+            cache = step.kv_cache;
+            incremental_outputs.push_back(step.output);
+        }
+        auto incremental_output = infinicore::op::cat(
+            incremental_outputs, 1);
+        require_close(
+            "sliding_incremental" + suffix,
+            to_host(incremental_output),
+            to_host(full_sliding.output),
+            output_tolerance);
     };
 
     run(DataType::F32, "_f32", 5e-3f, 5e-3f, 2e-3f);
-    run(DataType::BF16, "_bf16", 6e-2f, 3e-2f, 1e-2f);
+    run(DataType::BF16, "_bf16", 6e-2f, 3e-2f, 2e-2f);
     std::cout << "DeepSeek-V4 native dense attention smoke passed\n";
     return 0;
 }

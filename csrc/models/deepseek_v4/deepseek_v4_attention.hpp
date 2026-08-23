@@ -6,6 +6,7 @@
 #include <infinicore/tensor.hpp>
 
 #include <memory>
+#include <optional>
 
 namespace infinilm::models::deepseek_v4 {
 
@@ -75,6 +76,15 @@ struct DeepseekV4AttentionProjections {
     infinicore::Tensor kv;
 };
 
+struct DeepseekV4SlidingAttentionOutput {
+    infinicore::Tensor output;
+    infinicore::Tensor attention_weights;
+    // RoPE-applied shared KV entries retained for the next call. Its sequence
+    // dimension is capped at sliding_window - 1, matching Transformers'
+    // DynamicSlidingWindowLayer semantics.
+    infinicore::Tensor kv_cache;
+};
+
 // Minimal, stateless DeepSeek-V4 attention core. It intentionally excludes the
 // sliding/CSA/HCA caches so the projection, partial-RoPE, sink and grouped
 // output math can be validated independently first.
@@ -108,6 +118,13 @@ public:
                 const infinicore::Tensor &cos,
                 const infinicore::Tensor &sin) const;
 
+    DeepseekV4SlidingAttentionOutput
+    forward_sliding(const infinicore::Tensor &hidden_states,
+                    const infinicore::Tensor &cos,
+                    const infinicore::Tensor &sin,
+                    const std::optional<infinicore::Tensor> &past_kv,
+                    size_t sliding_window) const;
+
 protected:
     INFINICORE_NN_MODULE(DeepseekV4Linear, q_a_proj);
     INFINICORE_NN_MODULE(DeepseekV4RMSNorm, q_a_norm);
@@ -127,9 +144,19 @@ private:
         const infinicore::Tensor &sin,
         bool conjugate) const;
     infinicore::Tensor causal_bias_(
-        size_t sequence_length,
+        size_t query_length,
+        size_t kv_length,
+        size_t past_length,
+        size_t sliding_window,
         const infinicore::DataType &dtype,
         const infinicore::Device &device) const;
+    DeepseekV4AttentionOutput attention_from_projections_(
+        const infinicore::Tensor &query,
+        const infinicore::Tensor &kv,
+        const infinicore::Tensor &cos,
+        const infinicore::Tensor &sin,
+        size_t past_length,
+        size_t sliding_window) const;
 
     size_t hidden_size_;
     size_t q_lora_rank_;
