@@ -94,7 +94,10 @@ def build_engine(args):
             )
 
         def close():
-            del llm
+            try:
+                llm.llm_engine.engine_core.shutdown()
+            except Exception:
+                pass
 
         engine_notes = {"engine": "vllm", "cuda_graph": True, "prefix_caching": True}
 
@@ -164,7 +167,6 @@ def main():
         )
 
     sampler.stop()
-    close()
 
     report = {
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -183,6 +185,13 @@ def main():
     with open(out_path, "w") as f:
         json.dump(report, f, indent=2, ensure_ascii=False)
     print(f"[bench] wrote {out_path}", flush=True)
+
+    # Shut down only after results are persisted; engine teardown must not
+    # be allowed to take the report down with it.
+    try:
+        close()
+    except Exception as e:
+        print(f"[bench] close() failed (results already saved): {e}", flush=True)
 
 
 if __name__ == "__main__":
