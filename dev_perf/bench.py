@@ -56,6 +56,7 @@ def build_engine(args):
             cache_type="paged",
             attn_backend="paged-attn",
             max_batch_size=64,
+            num_blocks=args.num_blocks,
             enable_prefix_caching=True,
             enable_graph=args.enable_graph,
         )
@@ -72,7 +73,7 @@ def build_engine(args):
         def close():
             llm.close()
 
-        engine_notes = {"engine": "infinilm", "cuda_graph": bool(args.enable_graph), "prefix_caching": True, "attn_backend": "paged-attn"}
+        engine_notes = {"engine": "infinilm", "cuda_graph": bool(args.enable_graph), "prefix_caching": True, "attn_backend": "paged-attn", "num_blocks": args.num_blocks}
 
     elif args.engine == "vllm":
         from vllm import LLM, SamplingParams
@@ -120,6 +121,12 @@ def main():
         "--enable-graph",
         action="store_true",
         help="infinilm only: enable graph compiling (CUDA-graph-like capture)",
+    )
+    parser.add_argument(
+        "--num-blocks",
+        type=int,
+        default=512,
+        help="infinilm only: paged KV cache blocks (x256 tokens); lower it for a low-VRAM run",
     )
     args = parser.parse_args()
 
