@@ -57,6 +57,7 @@ def build_engine(args):
             attn_backend="paged-attn",
             max_batch_size=64,
             enable_prefix_caching=True,
+            enable_graph=args.enable_graph,
         )
 
         def generate(prompts, max_tokens):
@@ -71,7 +72,7 @@ def build_engine(args):
         def close():
             llm.close()
 
-        engine_notes = {"engine": "infinilm", "cuda_graph": False, "prefix_caching": True, "attn_backend": "paged-attn"}
+        engine_notes = {"engine": "infinilm", "cuda_graph": bool(args.enable_graph), "prefix_caching": True, "attn_backend": "paged-attn"}
 
     elif args.engine == "vllm":
         from vllm import LLM, SamplingParams
@@ -114,6 +115,11 @@ def main():
     parser.add_argument(
         "--out-dir",
         default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "results"),
+    )
+    parser.add_argument(
+        "--enable-graph",
+        action="store_true",
+        help="infinilm only: enable graph compiling (CUDA-graph-like capture)",
     )
     args = parser.parse_args()
 
