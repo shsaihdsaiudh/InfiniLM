@@ -6,7 +6,7 @@ infini_root=${INFINI_ROOT:-"$HOME/.infini-dsv4"}
 cuda_home=${CUDA_HOME:-"$HOME/.local/cuda-13.2"}
 torch_lib=${TORCH_LIB:-$(python -c \
     'import os, torch; print(os.path.join(os.path.dirname(torch.__file__), "lib"))')}
-output="$repo_root/build/linux/x86_64/release/dsv4_hca_native_smoke"
+output="$repo_root/build/linux/x86_64/release/dsv4_csa_native_smoke"
 mkdir -p "$(dirname "$output")"
 
 g++ \
@@ -16,10 +16,10 @@ g++ \
     -I"$infini_root/include" \
     -I"$repo_root/third_party/spdlog/include" \
     -I"$repo_root/third_party/json/single_include" \
-    "$repo_root/dev_dsv4/hca_native_smoke.cpp" \
+    "$repo_root/dev_dsv4/csa_native_smoke.cpp" \
+    "$repo_root/csrc/models/deepseek_v4/deepseek_v4_csa_compressor.cpp" \
     "$repo_root/csrc/models/deepseek_v4/deepseek_v4_hca_compressor.cpp" \
     "$repo_root/csrc/models/deepseek_v4/deepseek_v4_attention.cpp" \
-    "$repo_root/csrc/models/deepseek_v4/deepseek_v4_csa_compressor.cpp" \
     -L"$infini_root/lib" \
     -Wl,-rpath,"$infini_root/lib" \
     -L"$torch_lib" \

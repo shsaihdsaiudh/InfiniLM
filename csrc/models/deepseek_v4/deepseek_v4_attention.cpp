@@ -1,4 +1,5 @@
 #include "deepseek_v4_attention.hpp"
+#include "deepseek_v4_csa_compressor.hpp"
 #include "deepseek_v4_hca_compressor.hpp"
 
 #include <infinicore/ops/add.hpp>
@@ -207,7 +208,11 @@ DeepseekV4Attention::DeepseekV4Attention(
     double rms_norm_eps,
     const infinicore::DataType &dtype,
     const infinicore::Device &device,
-    size_t hca_compress_rate)
+    size_t hca_compress_rate,
+    size_t csa_compress_rate,
+    size_t index_num_heads,
+    size_t index_head_dim,
+    size_t index_topk)
     : hidden_size_(hidden_size),
       q_lora_rank_(q_lora_rank),
       num_attention_heads_(num_attention_heads),
@@ -221,7 +226,8 @@ DeepseekV4Attention::DeepseekV4Attention(
         || rope_head_dim_ == 0 || rope_head_dim_ > head_dim_
         || rope_head_dim_ % 2 != 0 || o_groups_ == 0
         || num_attention_heads_ % o_groups_ != 0
-        || o_lora_rank_ == 0 || rms_norm_eps_ <= 0.0) {
+        || o_lora_rank_ == 0 || rms_norm_eps_ <= 0.0
+        || (hca_compress_rate != 0 && csa_compress_rate != 0)) {
         throw std::runtime_error(
             "DeepSeek-V4 attention configuration is invalid");
     }
@@ -256,12 +262,26 @@ DeepseekV4Attention::DeepseekV4Attention(
     q_b_norm_weight_f32_ = infinicore::Tensor::ones(
         {head_dim_}, infinicore::DataType::F32, device);
     if (hca_compress_rate != 0) {
-        compressor_ = this->register_module<DeepseekV4HCACompressor>(
+        hca_compressor_ = this->register_module<DeepseekV4HCACompressor>(
             "compressor",
             hidden_size_,
             head_dim_,
             rope_head_dim_,
             hca_compress_rate,
+            rms_norm_eps_,
+            dtype,
+            device);
+    } else if (csa_compress_rate != 0) {
+        csa_compressor_ = this->register_module<DeepseekV4CSACompressor>(
+            "compressor",
+            hidden_size_,
+            q_lora_rank_,
+            head_dim_,
+            rope_head_dim_,
+            csa_compress_rate,
+            index_num_heads,
+            index_head_dim,
+            index_topk,
             rms_norm_eps_,
             dtype,
             device);
@@ -445,7 +465,7 @@ DeepseekV4SlidingAttentionOutput DeepseekV4Attention::forward_hca(
     const std::optional<infinicore::Tensor> &past_sliding_kv,
     DeepseekV4HCAState *hca_state,
     size_t sliding_window) const {
-    if (!compressor_) {
+    if (!hca_compressor_) {
         throw std::runtime_error(
             "DeepSeek-V4 HCA attention was constructed without a compressor");
     }
@@ -475,7 +495,7 @@ DeepseekV4SlidingAttentionOutput DeepseekV4Attention::forward_hca(
             {past, projections.kv}, 1);
     }
 
-    auto compressed = compressor_->forward(
+    auto compressed = hca_compressor_->forward(
         hidden_states,
         compressed_cos,
         compressed_sin,
@@ -513,6 +533,99 @@ DeepseekV4SlidingAttentionOutput DeepseekV4Attention::forward_hca(
         combined_bias = infinicore::op::cat(
             {sliding_bias, long_range_bias}, 3);
     }
+
+    auto attention = attention_from_projections_(
+        projections.query,
+        combined_kv,
+        query_cos,
+        query_sin,
+        0,
+        0,
+        combined_bias);
+    const size_t sliding_length = sliding_kv->size(1);
+    const size_t retained_length = std::min(
+        sliding_length, sliding_window - 1);
+    auto next_sliding_cache = sliding_kv
+                                  ->narrow({{1,
+                                            sliding_length - retained_length,
+                                            retained_length}})
+                                  ->contiguous();
+    return {
+        attention.output,
+        attention.attention_weights,
+        next_sliding_cache};
+}
+
+DeepseekV4SlidingAttentionOutput DeepseekV4Attention::forward_csa(
+    const infinicore::Tensor &hidden_states,
+    const infinicore::Tensor &query_cos,
+    const infinicore::Tensor &query_sin,
+    const infinicore::Tensor &compressed_cos,
+    const infinicore::Tensor &compressed_sin,
+    const infinicore::Tensor &position_ids,
+    const std::optional<infinicore::Tensor> &past_sliding_kv,
+    DeepseekV4CSAState *csa_state,
+    size_t sliding_window) const {
+    if (!csa_compressor_) {
+        throw std::runtime_error(
+            "DeepSeek-V4 CSA attention was constructed without a compressor");
+    }
+    if (sliding_window < 2) {
+        throw std::runtime_error(
+            "DeepSeek-V4 CSA attention requires sliding_window >= 2");
+    }
+    auto projections = project_qkv(
+        hidden_states, query_cos, query_sin);
+    const size_t batch_size = hidden_states->size(0);
+    const size_t query_length = hidden_states->size(1);
+    size_t past_length = 0;
+    auto sliding_kv = projections.kv;
+    if (past_sliding_kv.has_value()) {
+        const auto &past = past_sliding_kv.value();
+        if (!past || past->ndim() != 4
+            || past->size(0) != batch_size || past->size(2) != 1
+            || past->size(3) != head_dim_
+            || past->dtype() != projections.kv->dtype()
+            || past->device() != projections.kv->device()
+            || past->size(1) > sliding_window - 1) {
+            throw std::runtime_error(
+                "DeepSeek-V4 CSA attention received an incompatible sliding cache");
+        }
+        past_length = past->size(1);
+        sliding_kv = infinicore::op::cat(
+            {past, projections.kv}, 1);
+    }
+
+    auto compressed = csa_compressor_->forward(
+        hidden_states,
+        projections.q_residual,
+        query_cos,
+        query_sin,
+        compressed_cos,
+        compressed_sin,
+        position_ids,
+        csa_state);
+    auto long_range_kv = compressed.compressed_kv
+                             ->permute({0, 2, 1, 3})
+                             ->contiguous();
+    auto combined_kv = long_range_kv->size(1) == 0
+        ? sliding_kv
+        : infinicore::op::cat({sliding_kv, long_range_kv}, 1);
+
+    auto sliding_bias = causal_bias_(
+        query_length,
+        sliding_kv->size(1),
+        past_length,
+        sliding_window,
+        combined_kv->dtype(),
+        combined_kv->device());
+    sliding_bias = broadcast_to_shape(
+        sliding_bias,
+        {batch_size, 1, query_length, sliding_kv->size(1)});
+    auto combined_bias = long_range_kv->size(1) == 0
+        ? sliding_bias
+        : infinicore::op::cat(
+              {sliding_bias, compressed.block_bias}, 3);
 
     auto attention = attention_from_projections_(
         projections.query,
@@ -657,7 +770,7 @@ DeepseekV4AttentionProjections DeepseekV4Attention::project_qkv(
     kv = kv_norm_->forward(kv)
              ->view({batch_size, sequence_length, 1, head_dim_});
     kv = apply_partial_rope_(kv, cos, sin, false);
-    return {query, kv};
+    return {q_residual, query, kv};
 }
 
 } // namespace infinilm::models::deepseek_v4

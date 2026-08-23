@@ -18,6 +18,7 @@ g++ \
     -I"$repo_root/third_party/json/single_include" \
     "$repo_root/dev_dsv4/attention_native_smoke.cpp" \
     "$repo_root/csrc/models/deepseek_v4/deepseek_v4_attention.cpp" \
+    "$repo_root/csrc/models/deepseek_v4/deepseek_v4_csa_compressor.cpp" \
     "$repo_root/csrc/models/deepseek_v4/deepseek_v4_hca_compressor.cpp" \
     -L"$infini_root/lib" \
     -Wl,-rpath,"$infini_root/lib" \

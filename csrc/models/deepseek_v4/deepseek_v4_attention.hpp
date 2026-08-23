@@ -12,6 +12,8 @@ namespace infinilm::models::deepseek_v4 {
 
 class DeepseekV4HCACompressor;
 struct DeepseekV4HCAState;
+class DeepseekV4CSACompressor;
+struct DeepseekV4CSAState;
 
 class DeepseekV4Linear : public infinicore::nn::Module {
 public:
@@ -73,6 +75,8 @@ struct DeepseekV4AttentionOutput {
 };
 
 struct DeepseekV4AttentionProjections {
+    // Weighted query LoRA residual consumed by the CSA Lightning Indexer.
+    infinicore::Tensor q_residual;
     // Query is [batch, sequence, heads, head_dim]. KV is the shared single
     // head in [batch, sequence, 1, head_dim]. Both already include RoPE.
     infinicore::Tensor query;
@@ -108,7 +112,11 @@ public:
                         double rms_norm_eps,
                         const infinicore::DataType &dtype,
                         const infinicore::Device &device,
-                        size_t hca_compress_rate = 0);
+                        size_t hca_compress_rate = 0,
+                        size_t csa_compress_rate = 0,
+                        size_t index_num_heads = 0,
+                        size_t index_head_dim = 0,
+                        size_t index_topk = 0);
 
     // hidden_states: [batch, sequence, hidden_size]
     // cos/sin:       [batch, sequence, rope_head_dim / 2]
@@ -140,6 +148,17 @@ public:
                 DeepseekV4HCAState *hca_state,
                 size_t sliding_window) const;
 
+    DeepseekV4SlidingAttentionOutput
+    forward_csa(const infinicore::Tensor &hidden_states,
+                const infinicore::Tensor &query_cos,
+                const infinicore::Tensor &query_sin,
+                const infinicore::Tensor &compressed_cos,
+                const infinicore::Tensor &compressed_sin,
+                const infinicore::Tensor &position_ids,
+                const std::optional<infinicore::Tensor> &past_sliding_kv,
+                DeepseekV4CSAState *csa_state,
+                size_t sliding_window) const;
+
 protected:
     INFINICORE_NN_MODULE(DeepseekV4Linear, q_a_proj);
     INFINICORE_NN_MODULE(DeepseekV4RMSNorm, q_a_norm);
@@ -149,7 +168,8 @@ protected:
     INFINICORE_NN_MODULE(DeepseekV4GroupedLinear, o_a_proj);
     INFINICORE_NN_MODULE(DeepseekV4Linear, o_b_proj);
     INFINICORE_NN_PARAMETER(sinks);
-    std::shared_ptr<DeepseekV4HCACompressor> compressor_;
+    std::shared_ptr<DeepseekV4HCACompressor> hca_compressor_;
+    std::shared_ptr<DeepseekV4CSACompressor> csa_compressor_;
 
 private:
     infinicore::Tensor unweighted_rms_norm_(

@@ -302,3 +302,35 @@ CPU 构造 block bias；后续需替换为设备侧 kernel，再进入 CUDA Grap
 
 下一步实现 CSA compressor 和 Lightning Indexer，优先先对齐 index score、top-k
 选择及稀疏 KV gather，再把异构层 cache 接入 decoder/model 调度。
+
+---
+
+## 验证笔记 #8：CSA compressor 与 Lightning Indexer（2026-08-24）
+
+新增 `DeepseekV4CSACompressor` 和 `DeepseekV4Indexer` correctness path：
+
+- outer compressor 和 indexer 各自维护 projected KV/gate 余数、上一完整窗口的
+  Ca overlap、compressed history 与 `entry_count`；
+- 每个压缩条目按官方布局组合“前一窗口 Ca + 当前窗口 Cb”，窗口宽度 `2m`、
+  stride `m`，首个窗口的缺失 Ca 使用 zero-KV / `-inf` gate；
+- gate 在 FP32 上沿窗口轴 softmax，随后 weighted RMSNorm 和 compress-RoPE；
+- Indexer query 使用 attention 的 weighted query-LoRA residual，评分严格实现
+  `sum_h w_h * ReLU(q_h dot k) / sqrt(head_dim) / sqrt(num_heads)`；
+- causal top-k 的无效位置返回 `-1`，再构造仅开放所选 compressed entry 的
+  block bias；CSA Attention 与 sliding KV 共用最终 softmax。
+
+native smoke 使用压缩率 2、`index_topk=1`、序列长度 5，覆盖首窗口、跨窗口
+overlap、余数缓存、causal top-k、prefill 和逐 token decode。结果：
+
+- FP32 outer compressor 参考误差 `2.38419e-7`，增量历史 `2.98023e-8`；
+- FP32 indexer 增量历史误差 `2.38419e-7`；
+- FP32 CSA prefill/decode 误差 `2.98172e-5`；
+- BF16 outer/indexer 参考误差分别为 `0.00941807` / `0.00931716`，
+  prefill/decode 误差为 `0`。
+
+dense、sliding、HCA 的 F32/BF16 原生回归均保持通过。当前 correctness path
+仍会把 `position_ids` 和 top-k indices 同步到 CPU 构造 causal/index mask；正式
+CUDA Graph 路径需换成设备侧 mask/scatter，并进一步接现有 DSA sparse kernel。
+
+下一步把三种 attention 路径和各自 state 接入 decoder/model 层调度，然后完成
+包含 mHC 与混合层型的 InfiniLM tiny 模型端到端对拍。
