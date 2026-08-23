@@ -174,3 +174,45 @@ INFINI_ROOT=/path/to/infinicore-aten dev_dsv4/run_mhc_native_smoke.sh
 所有 scale/base/epsilon 必须先显式 `broadcast_to`；`cast_` 在 `aten=false`
 构建中不可用。V4 正式运行环境因此需要 `aten=true`，除非后续在 InfiniCore
 补一个不依赖 ATen 的原生 dtype cast。
+
+---
+
+## 验证笔记 #4：ATen/BF16 环境与最小 dense Attention（2026-08-23）
+
+V4 专用 InfiniCore 已固定到 `~/.infini-dsv4`。该前缀启用 ATen，保留
+CUDA 13.2、`sm_120`、CUDA Graph，并关闭本机不需要的 NCCL/cuDNN；它与
+稳定的 `~/.infini` 并存，不覆盖现有开发环境。InfiniLM 使用该前缀完成了
+全量 C++ 编译和最终动态链接。
+
+新增的 `DeepseekV4Attention` 是无 cache 的最小 dense correctness path，已覆盖：
+
+- `q_a_proj -> weighted RMSNorm -> q_b_proj -> unweighted RMSNorm`；
+- 单共享 KV 头及其 weighted RMSNorm；
+- head 尾部的 interleaved partial RoPE；
+- causal mask、每头 learnable sink，以及丢弃 sink 概率后的注意力输出；
+- 对输出 RoPE 区间施加共轭旋转；
+- block-diagonal grouped `o_a_proj` 和最终 `o_b_proj`；
+- 与官方 checkpoint 一致的参数键名。
+
+`dev_dsv4/attention_native_smoke.cpp` 使用独立 CPU 公式，在 RTX 5060 Ti 上
+逐段对拍 Query、KV、attention weights 和最终输出。最大绝对误差：
+
+- FP32：`query=0.00372711`、`kv=0.000153542`、
+  `weights=0.00042513`、`output=0.000115568`；
+- BF16：`query=0.0514424`、`kv=0.0107355`、
+  `weights=0.00761053`、`output=0.00126566`。
+
+Query 的 BF16 误差是 tiny 维度下连续两层 BF16 projection 相对 FP32 CPU
+参考的累计误差；最终输出和权重仍在预设容差内。验证还发现 partial RoPE
+的奇偶通道 `narrow` 视图必须先 `contiguous()`，否则当前 InfiniCore
+elementwise kernel 会按错误的连续布局读取。
+
+复现：
+
+```bash
+INFINI_ROOT="$HOME/.infini-dsv4" dev_dsv4/run_mhc_native_smoke.sh
+INFINI_ROOT="$HOME/.infini-dsv4" dev_dsv4/run_attention_native_smoke.sh
+```
+
+下一步是在该核心上加入 sliding-window KV cache 与 prefill/decode 增量对拍，
+再接 CSA/HCA compressor 和 Lightning Indexer。
