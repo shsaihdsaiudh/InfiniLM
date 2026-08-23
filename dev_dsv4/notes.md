@@ -58,3 +58,78 @@
 python dev_dsv4/ref_baseline.py        # 生成/校验基线（含增量一致性自检）
 python dev_dsv4/check_incremental.py   # 分层型一致性诊断
 ```
+
+---
+
+## 调研笔记 #2：checkpoint Go/No-Go（2026-08-23）
+
+新增 `dev_dsv4/check_checkpoint_format.py`，通过 HTTP Range 只读取 48 个
+safetensors header，不下载权重数据。全量检查结果：
+
+- 72,317 个 tensor，总大小 155.418 GiB；
+- I8 packed expert weight 138.000 GiB；
+- F8_E8M0 scale 8.625 GiB；
+- F8_E4M3 weight 5.871 GiB；
+- routed experts（weight + scale）合计 146.625 GiB；
+- 35,718 组 `weight/scale` 全部位于同一 shard，可逐 shard 转换；
+- base-model 的 34,223 个非 scale source key 全部能映射到唯一目标 key，
+  无碰撞和未处理项。
+
+第一道 Go/No-Go 结论为**通过**：
+
+- dense FP8 权重先按 128×128 block scale 逐 shard 解量化到 BF16；
+- routed expert I8 carrier 与 E8M0 scale 用 `view(uint8)` 无损转成
+  InfiniCore MXFP4 storage；
+- `mtp.*` 在本期 base-model path 中明确丢弃；
+- mHC、attention sink 和 router correction bias 的 F32 dtype 必须保留。
+
+相应实现与测试位于：
+
+- `python/infinilm/modeling_utils.py`：V4 dtype 保留、逐 shard dequant、key remap；
+- `test/models/deepseek_v4/test_checkpoint_loading.py`：E8M0 bit-pattern 和
+  dense/packed remap 回归测试；
+- `csrc/models/deepseek_v4/deepseek_v4_config.*`：config 校验与层型展开。
+
+---
+
+## 开发环境基线（2026-08-23）
+
+已完成本机 NVIDIA 开发链路的真实构建与运行验证：
+
+- xmake `v3.1.0`：`~/.local/xmake-3.1.0`，入口为 `~/.local/bin/xmake`；
+- InfiniCore 固定提交：`46ca684929aaa2ce69fb1b288787e8a859e26c93`；
+- InfiniCore 安装前缀：`~/.infini`；
+- 构建目标：CUDA 13.2、`sm_120`、CUDA Graph；单卡开发配置关闭 NCCL、cuDNN；
+- InfiniLM Python 环境：仓库 `.venv`（复用系统 site-packages），C++ ABI 为 1；
+- InfiniLM 全量 C++ 扩展编译通过，V4 loader 测试 3/3 通过；
+- RTX 5060 Ti 上真实 InfiniCore `add` 算子通过，max diff `2.3841858e-7`；
+- `_infinilm` 的依赖解析到 `~/.infini/lib`，CUDA runtime 解析到
+  `~/.local/cuda-13.2/lib64/libcudart.so.13`。
+
+InfiniCore 当前提交需要两个本机构建兼容补丁：
+
+1. `xmake.lua` 的 `cuda_arch` 白名单补入 `sm_120`；
+2. `cudnn=n` 时排除 `avg_pool3d` 的 NVIDIA/cuDNN 实现，避免同时加载
+   PyTorch CUDA 12.8 cuDNN 与 CUDA 13.2 runtime。
+
+进入开发环境：
+
+```bash
+source .venv/bin/activate
+export PATH="$HOME/.local/bin:$PATH"
+export INFINI_ROOT="$HOME/.infini"
+export CUDA_HOME="$HOME/.local/cuda-13.2"
+export LD_LIBRARY_PATH="$INFINI_ROOT/lib:$CUDA_HOME/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export INFINILM_CXX11_ABI=1
+```
+
+回归命令：
+
+```bash
+python -m pytest -q test/models/deepseek_v4/test_checkpoint_loading.py
+xmake build -y -j8 _infinilm
+```
+
+2026-08-23 本地复验结果：loader `3 passed`；tiny baseline 的 sliding、CSA、
+HCA 和 mixed 四种分层增量路径最大绝对误差均不超过 `1.1e-6`；C++ 扩展增量
+构建通过。

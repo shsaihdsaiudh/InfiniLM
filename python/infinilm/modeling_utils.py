@@ -105,6 +105,7 @@ def load_state_dict(
     device="cpu",
     dtype=torch.bfloat16,
     preserve_fp32_suffixes: Tuple[str, ...] = (".e_score_correction_bias",),
+    preserve_dtype_suffixes: Tuple[str, ...] = (),
 ) -> Dict[str, torch.Tensor]:
     """
     Reads a `safetensor` checkpoint file. We load the checkpoint on "cpu" by default.
@@ -129,7 +130,8 @@ def load_state_dict(
         for k in f.keys():
             tensor = f.get_tensor(k)
             preserve_fp32 = k.endswith(preserve_fp32_suffixes)
-            if tensor.is_floating_point() and not preserve_fp32:
+            preserve_dtype = k.endswith(preserve_dtype_suffixes)
+            if tensor.is_floating_point() and not (preserve_fp32 or preserve_dtype):
                 tensor = tensor.to(device=device, dtype=dtype)
             else:
                 tensor = tensor.to(device=device)
@@ -202,8 +204,28 @@ def load_model_state_dict_by_file(
 
     model_type = model.hf_config.get("model_type", "")
     preserve_fp32_suffixes = (".e_score_correction_bias",)
+    preserve_dtype_suffixes = ()
     if model_type == "kimi_k3":
         preserve_fp32_suffixes += (".A_log", ".dt_bias")
+    elif model_type == "deepseek_v4":
+        preserve_fp32_suffixes += (
+            ".attn_sink",
+            ".ffn.gate.bias",
+            "hc_attn_base",
+            "hc_attn_fn",
+            "hc_attn_scale",
+            "hc_ffn_base",
+            "hc_ffn_fn",
+            "hc_ffn_scale",
+            "hc_head_base",
+            "hc_head_fn",
+            "hc_head_scale",
+        )
+        # V4 stores block-quantization scales as FP8 E8M0 tensors named
+        # ``*.scale``.  Their bit pattern is required by the native FP4 path,
+        # so keep the checkpoint dtype until the model-specific remapper has
+        # converted them into the registered packed representation.
+        preserve_dtype_suffixes += (".scale",)
 
     torch_device = "cpu"
     torch_dtype = infinicore.utils.to_torch_dtype(dtype)
@@ -246,6 +268,7 @@ def load_model_state_dict_by_file(
                 device=torch_device,
                 dtype=torch_dtype,
                 preserve_fp32_suffixes=preserve_fp32_suffixes,
+                preserve_dtype_suffixes=preserve_dtype_suffixes,
             )
 
             # Apply model-specific weight remapping
@@ -1071,6 +1094,172 @@ def _remap_kimi_k3(state_dict, config):
     return state_dict
 
 
+def _deepseek_v4_target_dtype(config):
+    dtype_name = config.get("torch_dtype") or config.get("dtype") or "bfloat16"
+    try:
+        return str_to_torch_dtype[dtype_name.upper()]
+    except KeyError:
+        aliases = {
+            "float16": torch.float16,
+            "bfloat16": torch.bfloat16,
+            "float32": torch.float32,
+        }
+        if dtype_name not in aliases:
+            raise ValueError(f"Unsupported DeepSeek-V4 target dtype: {dtype_name}")
+        return aliases[dtype_name]
+
+
+def _dequantize_deepseek_v4_fp8(weight, scale, block_size, target_dtype):
+    if weight.ndim != 2 or scale.ndim != 2:
+        raise ValueError(
+            "DeepSeek-V4 block-scaled weights and scales must both be matrices, "
+            f"got {tuple(weight.shape)} and {tuple(scale.shape)}"
+        )
+
+    block_rows, block_cols = block_size
+    expected_scale_shape = (
+        (weight.shape[0] + block_rows - 1) // block_rows,
+        (weight.shape[1] + block_cols - 1) // block_cols,
+    )
+    if tuple(scale.shape) != expected_scale_shape:
+        raise ValueError(
+            "DeepSeek-V4 scale shape mismatch: "
+            f"expected {expected_scale_shape}, got {tuple(scale.shape)}"
+        )
+
+    expanded_scale = scale.float().repeat_interleave(block_rows, dim=0)
+    expanded_scale = expanded_scale.repeat_interleave(block_cols, dim=1)
+    expanded_scale = expanded_scale[: weight.shape[0], : weight.shape[1]]
+    return (weight.float() * expanded_scale).to(target_dtype).contiguous()
+
+
+def _remap_deepseek_v4_key(key):
+    if key == "embed.weight":
+        return "model.embed_tokens.weight"
+    if key == "norm.weight":
+        return "model.norm.weight"
+    if key == "head.weight":
+        return "lm_head.weight"
+    if key.startswith("hc_head_"):
+        return "model.hc_head.hc_" + key.removeprefix("hc_head_")
+
+    layer_match = re.match(r"layers\.(\d+)\.(.+)", key)
+    if layer_match is None:
+        return key
+
+    layer, suffix = layer_match.groups()
+    prefix = f"model.layers.{layer}."
+    layer_level_names = {
+        "attn_norm.weight": "input_layernorm.weight",
+        "ffn_norm.weight": "post_attention_layernorm.weight",
+        "hc_attn_base": "attn_hc.base",
+        "hc_attn_fn": "attn_hc.fn",
+        "hc_attn_scale": "attn_hc.scale",
+        "hc_ffn_base": "ffn_hc.base",
+        "hc_ffn_fn": "ffn_hc.fn",
+        "hc_ffn_scale": "ffn_hc.scale",
+    }
+    if suffix in layer_level_names:
+        return prefix + layer_level_names[suffix]
+
+    if suffix.startswith("attn."):
+        suffix = suffix.removeprefix("attn.")
+        attention_names = {
+            "attn_sink": "sinks",
+            "wq_a": "q_a_proj",
+            "q_norm": "q_a_norm",
+            "wq_b": "q_b_proj",
+            "wkv": "kv_proj",
+            "kv_norm": "kv_norm",
+            "wo_a": "o_a_proj",
+            "wo_b": "o_b_proj",
+        }
+        for source, target in attention_names.items():
+            if suffix == source or suffix.startswith(source + "."):
+                suffix = target + suffix[len(source) :]
+                return prefix + "self_attn." + suffix
+
+        compressor_names = {
+            "compressor.ape": "compressor.position_bias",
+            "compressor.wkv": "compressor.kv_proj",
+            "compressor.wgate": "compressor.gate_proj",
+            "compressor.norm": "compressor.kv_norm",
+            "indexer.compressor.ape": "compressor.indexer.position_bias",
+            "indexer.compressor.wkv": "compressor.indexer.kv_proj",
+            "indexer.compressor.wgate": "compressor.indexer.gate_proj",
+            "indexer.compressor.norm": "compressor.indexer.kv_norm",
+            "indexer.wq_b": "compressor.indexer.q_b_proj",
+            "indexer.weights_proj": "compressor.indexer.scorer.weights_proj",
+        }
+        for source, target in compressor_names.items():
+            if suffix == source or suffix.startswith(source + "."):
+                suffix = target + suffix[len(source) :]
+                return prefix + "self_attn." + suffix
+
+    if suffix.startswith("ffn."):
+        suffix = suffix.removeprefix("ffn.")
+        suffix = suffix.replace("gate.bias", "gate.e_score_correction_bias", 1)
+        shared_names = {
+            "shared_experts.w1": "shared_experts.gate_proj",
+            "shared_experts.w3": "shared_experts.up_proj",
+            "shared_experts.w2": "shared_experts.down_proj",
+        }
+        for source, target in shared_names.items():
+            if suffix == source or suffix.startswith(source + "."):
+                suffix = target + suffix[len(source) :]
+                break
+        return prefix + "mlp." + suffix
+
+    return prefix + suffix
+
+
+def _remap_deepseek_v4(state_dict, config):
+    """Map the released V4 inference checkpoint to InfiniLM parameter names.
+
+    Dense FP8 block-scaled matrices are dequantized per shard for the initial
+    correctness path. Routed experts remain packed FP4: their I8 carrier and
+    E8M0 scales are reinterpreted as U8 without changing any bits.
+    """
+
+    quant_config = config.get("quantization_config") or {}
+    block_size = tuple(quant_config.get("weight_block_size", (128, 128)))
+    if len(block_size) != 2 or any(size <= 0 for size in block_size):
+        raise ValueError(f"Invalid DeepSeek-V4 weight_block_size: {block_size}")
+    target_dtype = _deepseek_v4_target_dtype(config)
+    remapped = {}
+
+    for key, tensor in state_dict.items():
+        if key.startswith("mtp.") or key.endswith(".scale"):
+            continue
+
+        scale_key = key.removesuffix(".weight") + ".scale"
+        scale = state_dict.get(scale_key) if key.endswith(".weight") else None
+        target_key = _remap_deepseek_v4_key(key)
+        is_routed_expert = ".experts." in key and ".shared_experts." not in key
+
+        if is_routed_expert and key.endswith(".weight"):
+            if scale is None:
+                raise ValueError(f"Missing DeepSeek-V4 FP4 scale for {key}")
+            if tensor.dtype != torch.int8:
+                raise ValueError(f"Expected packed I8 DeepSeek-V4 expert weight: {key}")
+            if scale.dtype != torch.float8_e8m0fnu:
+                raise ValueError(f"Expected E8M0 DeepSeek-V4 expert scale: {scale_key}")
+            remapped[target_key.replace(".weight", ".weight_packed")] = (
+                tensor.view(torch.uint8).contiguous()
+            )
+            remapped[target_key.replace(".weight", ".weight_scale")] = (
+                scale.view(torch.uint8).contiguous()
+            )
+        elif scale is not None:
+            remapped[target_key] = _dequantize_deepseek_v4_fp8(
+                tensor, scale, block_size, target_dtype
+            )
+        else:
+            remapped[target_key] = tensor
+
+    return remapped
+
+
 _WEIGHT_REMAPPER = {
     "glm4": _remap_glm4,
     "chatglm": _remap_chatglm,
@@ -1083,4 +1272,5 @@ _WEIGHT_REMAPPER = {
     "qwen3_5_moe": _remap_qwen3_5_moe,
     "qwen3_next": _remap_qwen3_next,
     "kimi_k3": _remap_kimi_k3,
+    "deepseek_v4": _remap_deepseek_v4,
 }
