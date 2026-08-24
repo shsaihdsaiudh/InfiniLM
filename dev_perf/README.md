@@ -4,19 +4,19 @@
 
 ## 运行前提
 
-1. InfiniCore 已构建且 InfiniLM 已在主 checkout 构建(`python/infinilm/lib/_infinilm*.so` 存在)。运行时动态库路径由 bench.py 自动 re-exec 注入(LD_LIBRARY_PATH ← InfiniCore/InfiniLM 的 lib 目录),无需手动设置
-2. vLLM 独立环境:`/home/yyy/src/venvs/vllm-bench`(uv 创建,cu128 torch;**勿装进项目 .venv**,vllm 会锁定 torch 版本)。运行时需带齐 `PATH=<vllm-bench>/bin:$HOME/.local/cuda-13.2/bin:$PATH` 和 `CUDA_HOME=$HOME/.local/cuda-13.2`(否则 EngineCore 找不到 ninja 起不来)
-3. GPU 空闲(本机常驻 llama-server 约占 11.4GB,压测前需要停);本机有 97% 显存看门狗,vLLM 侧 `--gpu-mem-util` 不要超过 ~0.8(0.85 × 16GB + 基线占用会撞线)
-4. WSL2 下 vLLM 需 `VLLM_WSL2_ENABLE_PIN_MEMORY=1`(bench.py 已自动设置;否则 vLLM 禁用 pinned memory 导致 UvaBuffer 报 "UVA is not available")
+1. InfiniCore 已构建安装（`INFINI_ROOT` 指向安装前缀，默认 `~/.infini`；flash-attn 后端需要 ATen+FA 版，见 gap_analysis.md v4），且当前 checkout 已构建 C++ 扩展（`xmake build _infinilm && xmake install`，产物在 `python/infinilm/lib/`）。运行时动态库路径由 bench.py 自动 re-exec 注入（LD_LIBRARY_PATH ← InfiniCore/InfiniLM 的 lib 目录），无需手动设置
+2. vLLM 独立环境：自建 venv（uv 创建，cu128 torch；**勿装进项目 venv**，vllm 会锁定 torch 版本）。运行时需带齐 `PATH=<vllm-venv>/bin:$CUDA_HOME/bin:$PATH` 和 `CUDA_HOME`（否则 EngineCore 找不到 ninja 起不来）
+3. GPU 空闲（压测前停掉常驻的 GPU 进程）；如本机有显存看门狗，vLLM 侧 `--gpu-mem-util` 不要超过 ~0.8
+4. WSL2 下 vLLM 需 `VLLM_WSL2_ENABLE_PIN_MEMORY=1`（bench.py 已自动设置；否则 vLLM 禁用 pinned memory 导致 UvaBuffer 报 "UVA is not available"）
 
 ## 运行
 
 ```bash
-# InfiniLM(用项目 .venv,通过 sys.path 引用主 checkout 的构建产物)
-/home/yyy/src/InfiniLM/.venv/bin/python dev_perf/bench.py --engine infinilm --model Qwen/Qwen3-1.7B
+# InfiniLM（任何带 torch 的 venv，通过 sys.path 引用当前 checkout 的构建产物）
+python dev_perf/bench.py --engine infinilm --model Qwen/Qwen3-1.7B
 
-# vLLM(独立 venv)
-/home/yyy/src/venvs/vllm-bench/bin/python dev_perf/bench.py --engine vllm --model Qwen/Qwen3-1.7B
+# vLLM（独立 venv）
+/path/to/vllm-venv/bin/python dev_perf/bench.py --engine vllm --model Qwen/Qwen3-1.7B
 ```
 
 结果 JSON 写入 `dev_perf/results/`。

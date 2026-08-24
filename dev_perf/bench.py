@@ -2,11 +2,11 @@
 
 One script, two interpreters:
 
-  InfiniLM (project .venv, imports the built package from the main checkout):
-    /home/yyy/src/InfiniLM/.venv/bin/python dev_perf/bench.py --engine infinilm --model Qwen/Qwen3-1.7B
+  InfiniLM (any venv with torch; imports the built package from this checkout):
+    python dev_perf/bench.py --engine infinilm --model Qwen/Qwen3-1.7B
 
   vLLM (isolated venv):
-    /home/yyy/src/venvs/vllm-bench/bin/python dev_perf/bench.py --engine vllm --model Qwen/Qwen3-1.7B
+    /path/to/vllm-venv/bin/python dev_perf/bench.py --engine vllm --model Qwen/Qwen3-1.7B
 
 Fairness contract: greedy decoding (temperature=0, top_k=1), ignore_eos=True,
 identical prompts and max_tokens from workload.py. vLLM runs with its v1
@@ -22,14 +22,15 @@ import time
 
 from workload import WORKLOADS, MemSampler, resolve_model_path
 
-MAIN_CHECKOUT_PYTHON = "/home/yyy/src/InfiniLM/python"
-# INFINI_ROOT selects the InfiniCore install (e.g. ~/.infini-dsv4 for the
-# ATen-enabled build, required by the flash-attn backend); defaults to the
-# non-ATen copy in the InfiniCore python package dir.
-_INFINI_CORE_LIB = (
-    os.path.join(os.environ["INFINI_ROOT"], "lib")
-    if os.environ.get("INFINI_ROOT")
-    else "/home/yyy/src/InfiniCore/python/infinicore/lib"
+# Checkout whose built infinilm package we benchmark. Defaults to this repo's
+# own python/ dir (where `xmake install _infinilm` lands its .so); override
+# with INF_MAIN_PYTHON to benchmark a different checkout's build.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+MAIN_CHECKOUT_PYTHON = os.environ.get("INF_MAIN_PYTHON", os.path.join(_REPO_ROOT, "python"))
+# INFINI_ROOT selects the InfiniCore install (e.g. ~/.infini-fa for the
+# ATen+FA build, required by the flash-attn backend); defaults to ~/.infini.
+_INFINI_CORE_LIB = os.path.join(
+    os.environ.get("INFINI_ROOT", os.path.expanduser("~/.infini")), "lib"
 )
 def _torch_lib_dir():
     """site-packages/torch/lib, needed on LD_LIBRARY_PATH for ATen-enabled
@@ -43,7 +44,7 @@ def _torch_lib_dir():
 
 LIB_DIRS = [
     _INFINI_CORE_LIB,
-    "/home/yyy/src/InfiniLM/python/infinilm/lib",
+    os.path.join(MAIN_CHECKOUT_PYTHON, "infinilm", "lib"),
 ] + ([_torch_lib_dir()] if _torch_lib_dir() else [])
 
 

@@ -1,8 +1,89 @@
 # 项目 #2 基线差距清单
 
-最新结论见 v4（2026-08-24）：B 方向落地——InfiniLM 接入 FlashAttention-2
-后，长 prefill 差距从 1.5~1.9× 收敛到 ~1.05~1.3×，输出与 paged-attn/vLLM
-逐 token 一致。
+最新结论见 v5（2026-08-24）：第二优化项之一落地——融合 per-head
+RMSNorm+RoPE（新增 `rms_norm_rope` 算子，已接入 Qwen3 paged 路径），
+0.6B 交错 ABBA e2e 收益 -4%~-23%，三层正确性证据齐备。注意本轮在
+8GB WSL2 机上完成（非 v1~v4 的 16GB 5060 Ti），收益量级待 16GB 机复测。
+
+---
+
+## v5（2026-08-24）：第二优化项之一落地 —— 融合 per-head RMSNorm+RoPE
+
+动机：v4 遗留的第二优化项——未融合 elementwise 链（~137ms/prefill，
+1.7B 口径；v3 nsys：rmsnorm+rope+swiglu 合计 ~157ms / ~590 次小
+kernel）。v5 先融合 attention 内的 q/k per-head RMSNorm + RoPE：每个
+张量 2 次 kernel launch + 2 遍显存往返 → 1 次，decode 每 token 省
+28 层 × 4 = 112 次 launch。
+
+**平台注意**：本轮实验在另一台机器（8GB 卡 + WSL2；实测显存驻留超
+~3~4GB 后带宽崩塌至 1~11 GB/s）完成，与 v1~v4 的 16GB 5060 Ti 不是
+同一平台，绝对数值不可直接比较。安排：计时 A/B 用 Qwen3-0.6B（小模型
+launch 开销占比更高，对融合更敏感），正确性对拍用 Qwen3-1.7B（慢速区
+不影响数值）。**收益量级需回 16GB 机复测确认。**
+
+做法：
+
+- InfiniCore 新增 `rms_norm_rope` 融合算子（11 个新文件）：C 层
+  `src/infiniop/ops/rms_norm_rope/`（CUDA kernel `cuda/kernel.cuh`：
+  fp32 归约 + 逐变体复刻 rope 舍入路径，GPT_J/NEOX × half/bf16）；
+  C++ 桥接 `include/infinicore/ops/rms_norm_rope.hpp`。约束：full-rotary
+  （head_dim = 2 × table_dim）、pos I32/I64、sin/cos F32。
+- InfiniLM 接线（`csrc/models/qwen3/qwen3_attention.cpp`）：
+  `forward_paged_` 的 q_norm/k_norm + 两次 rope 共 4 处调用 → 两次
+  in-place `rms_norm_rope_`（prefill/decode 共用路径）；
+  `forward_static_` 保持未融合链不变。当前仅覆盖 Qwen3 paged 路径。
+
+性能（0.6B，flash-attn，交错 ABBA 控漂移——本机存在"越跑越慢"漂移，
+A2 全面慢于 A1，单次先后 A/B 会系统性扭曲差值）：
+
+| 负载 | A1 未融合 | A2 未融合 | B1 融合 | B2 融合 | e2e Δ |
+|---|---|---|---|---|---|
+| w1 单请求 decode | 1.00s | 1.05s | 0.92s | 1.05s | **-3.9%** |
+| w2 长 prefill + 128 decode | 1.49s | 1.72s | 1.20s | 1.26s | **-23.4%** |
+| w3 batch32 | 1.56s | 1.77s | 1.33s | 1.35s | **-19.5%** |
+| w4 长 decode | 9.06s | 9.65s | 8.01s | 8.14s | **-13.7%** |
+
+机制自洽性：decode 为 launch-bound，每 token 省 112 次 launch × ~10µs
+≈ 1.1ms，与 w4 的 -13.7%（8.8→7.9 ms/tok）吻合；w2/w3 的更大收益叠加
+了 prefill/批处理段 elementwise 链融合。首轮未控漂移数据方向一致
+（paged-attn：w1 -12.9%、w2 -7.9%、w3 -20.0%、w4 -10.8%；flash-attn
+w4 -25.0%）。
+
+正确性（三层证据）：
+
+1. **算子级**（`dev_perf/op_check_rms_norm_rope.cpp`：bf16 输入下融合
+   kernel vs `rms_norm_` + `rope_` 参考链逐元素对比）：**>99.999% 逐位
+   一致，最差 ~3ulp**——差异仅来自融合 kernel 内 fp32 归约的分块顺序。
+2. **0.6B e2e 逐 token 对拍**（fused vs unfused，双后端，
+   `compare_outputs.py`）：分叉率与"同二进制换后端"噪声底同量级
+   （w2 两侧均 exact；w3 28~29/32 vs 底 30/32；w4 分叉为单请求
+   late-token 并列翻牌）。
+3. **1.7B e2e 逐 token 对拍**（双后端）：分叉位置与噪声底互有先后——
+   w2-paged @59、w4-flash @190 与底完全重合，w1-paged 与 w2-flash 的
+   fused 全 exact 而底自身分叉（@92 / @59）；目检 w4 分叉处两侧文本
+   均为连贯枚举（"从文学角度分析" vs "从人类社会角度分析"），1024
+   token 全程连贯。结论：bf16 logit 并列翻牌经自回归放大，非功能错误。
+
+结论与剩余项：
+
+1. rms_norm_rope 融合在 0.6B 上 e2e 收益 -4%~-23%（负载相关，prefill/
+   批处理越重收益越大），正确性三层证据齐备；**16GB 机上量级待复测**。
+2. 未覆盖：swiglu 融合（v3 口径中 elementwise 链的另一半）、Qwen3
+   以外模型、`forward_static_` 路径。
+3. 工程配套：bench.py/README 去硬编码路径（INFINI_ROOT 默认
+   `~/.infini`，INF_MAIN_PYTHON 可指向其他 checkout 的构建产物）。
+
+复现：
+
+```bash
+# 前提：FA 版 InfiniCore（见 v4，rms_norm_rope 已在库中）；增量重建 InfiniLM 扩展
+cd <InfiniLM-perf> && xmake build _infinilm && xmake install
+HF_HUB_OFFLINE=1 INFINI_ROOT=$HOME/.infini-fa PYTHONPATH=<InfiniCore>/python \
+  python dev_perf/bench.py --engine infinilm --num-blocks 64 \
+  --attn-backend flash-attn --dump-outputs
+python dev_perf/compare_outputs.py <unfused.json> <fused.json>
+# 算子级校验的构建/运行命令见 dev_perf/op_check_rms_norm_rope.cpp 头部注释
+```
 
 ---
 
@@ -167,8 +248,11 @@ elementwise 链未融合。这是边界清晰、可度量的 kernel 优化目标
 - [x] ~~prefill attention kernel 优化立项~~ —— 已由 v4 完成：接 FA2
       （`--attn-backend flash-attn` + FA 版 InfiniCore），w2 的 prefill 段
       差距收敛到 ~1.05~1.3×，正确性逐 token 对拍通过。
-- [ ] （可选）elementwise 融合（rmsnorm/rope/swiglu）作为第二优化项——
-      v4 后它已成为 w2 剩余差距的第一来源（~137ms/prefill，1.7B 口径）。
+- [x] ~~（可选）elementwise 融合（rmsnorm/rope）作为第二优化项~~ ——
+      已由 v5 完成：`rms_norm_rope` 算子接入 Qwen3 paged 路径，0.6B
+      ABBA e2e -4%~-23%，三层正确性证据齐备；16GB 机复测待做。
+- [ ] （可选）swiglu 融合——v5 后 elementwise 链剩余的一半（v3 口径
+      rmsnorm+rope+swiglu 合计 ~157ms/prefill）。
 - [ ] （可选）flash-attn 设为默认 attention backend 的评估：需在更多模型
       上补正确性对拍，并确认 FP8/滑窗/softcap 模型的回退路径。
 - [ ] Qwen3-8B-FP8 下载完成后，可作为 8B 级 + FP8 口径的复测对象。
