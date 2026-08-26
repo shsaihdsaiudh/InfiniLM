@@ -18,6 +18,7 @@
 namespace infinilm::models::deepseek_v4 {
 namespace {
 
+// cast_to：转 dtype；相同则直接返回。
 infinicore::Tensor cast_to(const infinicore::Tensor &input,
                            const infinicore::DataType &dtype) {
     if (input->dtype() == dtype) {
@@ -38,6 +39,7 @@ infinicore::Tensor broadcast_to_shape(const infinicore::Tensor &input,
         input, std::vector<int64_t>(shape.begin(), shape.end()));
 }
 
+// 校验 HCA 的累积状态张量形状一致（buffer/compressed 都要 [batch, len, head_dim]）。
 void validate_state_tensor(const infinicore::Tensor &tensor,
                            size_t batch_size,
                            size_t head_dim,
@@ -57,6 +59,10 @@ void validate_state_tensor(const infinicore::Tensor &tensor,
 
 } // namespace
 
+// DeepseekV4HCACompressor：HCA 压缩器——把原始 KV 按 compress_rate（128）倍压缩成摘要条目。
+// 思想：每 compress_rate 个 token 的 KV 加权池化（用 gate 学权重）成 1 个"压缩条目"，
+// 这些条目作为"远距离记忆"参与注意力。状态跨 token 累积：不满一个窗口的 KV 存 buffer，
+// 满一个窗口就压成一个条目，追加进 compressed_kv。
 DeepseekV4HCACompressor::DeepseekV4HCACompressor(
     size_t hidden_size,
     size_t head_dim,
@@ -74,17 +80,21 @@ DeepseekV4HCACompressor::DeepseekV4HCACompressor(
         || compress_rate_ == 0 || rms_norm_eps <= 0.0) {
         throw std::runtime_error("DeepSeek-V4 HCA configuration is invalid");
     }
+    // 参数：kv_proj（算源 KV）、gate_proj（算池化权重）、kv_norm、position_bias
     INFINICORE_NN_MODULE_INIT(
         kv_proj, hidden_size_, head_dim_, dtype, device);
     INFINICORE_NN_MODULE_INIT(
         gate_proj, hidden_size_, head_dim_, dtype, device);
     INFINICORE_NN_MODULE_INIT(
         kv_norm, head_dim_, rms_norm_eps, dtype, device);
+    // position_bias：每个窗口内位置的可学习偏置（compress_rate × head_dim）
     INFINICORE_NN_PARAMETER_INIT(
         position_bias,
         ({compress_rate_, head_dim_}, dtype, device));
 }
 
+// 给压缩条目做 partial RoPE（同 attention，只旋转 rope_head_dim 维）。
+// 这里输入是 [batch, entries, head_dim]（3 维，因为压缩条目没有"头"维度）。
 infinicore::Tensor DeepseekV4HCACompressor::apply_partial_rope_(
     const infinicore::Tensor &input,
     const infinicore::Tensor &cos,
@@ -102,10 +112,12 @@ infinicore::Tensor DeepseekV4HCACompressor::apply_partial_rope_(
     const size_t pair_count = rope_head_dim_ / 2;
     const size_t nope_dim = head_dim_ - rope_head_dim_;
 
+    // 不旋转的 nope 段原样保留
     infinicore::Tensor nope;
     if (nope_dim != 0) {
         nope = input->narrow({{2, 0, nope_dim}})->contiguous();
     }
+    // 旋转段重排成 [pair_count, 2]，rotated = [-x1, x0]
     auto rope = input->narrow({{2, nope_dim, rope_head_dim_}})
                     ->contiguous()
                     ->view({batch_size, sequence_length, pair_count, 2});
@@ -113,6 +125,7 @@ infinicore::Tensor DeepseekV4HCACompressor::apply_partial_rope_(
     auto second = rope->narrow({{3, 1, 1}})->contiguous();
     auto rotated = infinicore::op::cat(
         {infinicore::op::mul_scalar(second, -1.0), first}, 3);
+    // 旋转公式：x·cos + rotated·sin
     const infinicore::Shape paired_shape{
         batch_size, sequence_length, pair_count, 2};
     auto cos_f32 = cast_to(cos, infinicore::DataType::F32)->unsqueeze(3);
@@ -128,12 +141,17 @@ infinicore::Tensor DeepseekV4HCACompressor::apply_partial_rope_(
         mixed->view(
             {batch_size, sequence_length, rope_head_dim_}),
         input->dtype());
+    // 拼回 nope 段
     if (nope_dim == 0) {
         return rotated_typed;
     }
     return infinicore::op::cat({nope, rotated_typed}, 2);
 }
 
+// 构造压缩条目的块掩码（block bias）：决定"当前 query 能看到哪些压缩条目"。
+// 规则：压缩条目 entry 代表原始 token 位置 [entry*rate, (entry+1)*rate)，
+// 所以 position < entry*rate 的 query 看不到 entry（causal 关系）。
+// 这里对 position+1 除以 rate 得到阈值，条目号 >= 阈值的都屏蔽（-inf）。
 std::optional<infinicore::Tensor>
 DeepseekV4HCACompressor::make_block_bias_(
     const infinicore::Tensor &position_ids,
@@ -146,13 +164,12 @@ DeepseekV4HCACompressor::make_block_bias_(
     }
     const size_t batch_size = position_ids->size(0);
     const size_t sequence_length = position_ids->size(1);
+    // 单 token 或没有压缩条目 → 不需要块掩码
     if (sequence_length == 1 || compressed_length == 0) {
         return std::nullopt;
     }
 
-    // Correctness path: materialize positions on CPU while constructing the
-    // irregular block bias. The integrated graph path should replace this
-    // with a device-side mask kernel before production serving.
+    // 正确性路径：在 CPU 上构造不规则块掩码（图路径后续用设备端 mask kernel 替代）
     auto positions_cpu = position_ids->to(infinicore::Device::cpu())
                              ->contiguous();
     std::vector<int64_t> positions(positions_cpu->numel());
@@ -180,6 +197,7 @@ DeepseekV4HCACompressor::make_block_bias_(
                 throw std::runtime_error(
                     "DeepSeek-V4 HCA position_ids must be non-negative");
             }
+            // 阈值 = (position+1) / rate，条目号 >= 阈值的不可见
             const size_t threshold =
                 (static_cast<size_t>(position) + 1) / compress_rate_;
             for (size_t entry = threshold;
@@ -200,6 +218,11 @@ DeepseekV4HCACompressor::make_block_bias_(
     return cast_to(cpu->to(device), dtype);
 }
 
+// HCA 压缩器前向：
+//   1. 算出源 KV 和源 gate（投影）
+//   2. 拼上历史 buffer（不满一个窗口的 KV）
+//   3. 把满窗口的 KV 按 gate 权重池化成压缩条目，追加进 compressed_kv
+//   4. 构造块掩码，返回全部压缩条目
 DeepseekV4HCAOutput DeepseekV4HCACompressor::forward(
     const infinicore::Tensor &hidden_states,
     const infinicore::Tensor &cos,
@@ -218,10 +241,12 @@ DeepseekV4HCAOutput DeepseekV4HCACompressor::forward(
         throw std::runtime_error(
             "DeepSeek-V4 HCA position_ids do not match hidden states");
     }
+    // ① 投影：源 KV 和源 gate
     auto source_kv = kv_proj_->forward(hidden_states);
     auto source_gate = gate_proj_->forward(hidden_states);
 
     if (state != nullptr) {
+        // 校验累积状态一致
         validate_state_tensor(
             state->buffer_kv, batch_size, head_dim_, source_kv, "buffer_kv");
         validate_state_tensor(
@@ -245,6 +270,7 @@ DeepseekV4HCAOutput DeepseekV4HCACompressor::forward(
             throw std::runtime_error(
                 "DeepSeek-V4 HCA compressed history/count is inconsistent");
         }
+        // ② 拼上历史 buffer（不满一个窗口的 KV/gate）
         if (state->buffer_kv && state->buffer_kv->size(1) != 0) {
             source_kv = infinicore::op::cat(
                 {state->buffer_kv, source_kv}, 1);
@@ -253,9 +279,12 @@ DeepseekV4HCAOutput DeepseekV4HCACompressor::forward(
         }
     }
 
+    // ③ 确定能压成完整窗口的 token 数：
+    //    usable = 向下取整到 rate 的倍数；new_entries = usable / rate
     const size_t source_length = source_kv->size(1);
     const size_t usable = source_length / compress_rate_ * compress_rate_;
     const size_t new_entries = usable / compress_rate_;
+    // 压缩条目的 cos/sin 数量必须等于 new_entries
     if (!cos || !sin || cos->ndim() != 3 || sin->ndim() != 3
         || cos->shape() != sin->shape() || cos->size(0) != batch_size
         || cos->size(1) != new_entries
@@ -264,6 +293,7 @@ DeepseekV4HCAOutput DeepseekV4HCACompressor::forward(
             "DeepSeek-V4 HCA cos/sin count does not match closed windows");
     }
 
+    // ④ 余下的 token（不满一个窗口）存进 buffer 留给下次
     if (state != nullptr) {
         const size_t remainder = source_length - usable;
         state->buffer_kv = source_kv
@@ -274,6 +304,7 @@ DeepseekV4HCAOutput DeepseekV4HCACompressor::forward(
                                  ->contiguous();
     }
 
+    // ⑤ 池化：每个窗口的 KV 用 gate 权重加权求和 → 1 个压缩条目
     infinicore::Tensor new_compressed;
     if (new_entries == 0) {
         new_compressed = infinicore::Tensor::empty(
@@ -281,6 +312,7 @@ DeepseekV4HCAOutput DeepseekV4HCACompressor::forward(
             source_kv->dtype(),
             source_kv->device());
     } else {
+        // 把 usable 个 token 重排成 [new_entries, rate, head_dim]（每个窗口一行）
         auto chunk_kv = source_kv
                             ->narrow({{1, 0, usable}})
                             ->contiguous()
@@ -297,6 +329,7 @@ DeepseekV4HCAOutput DeepseekV4HCACompressor::forward(
                                       head_dim_});
         const infinicore::Shape window_shape{
             batch_size, new_entries, compress_rate_, head_dim_};
+        // gate logits = 源 gate + position_bias（窗口内位置的可学习偏置）
         auto gate_logits = infinicore::op::add(
             cast_to(chunk_gate, infinicore::DataType::F32),
             broadcast_to_shape(
@@ -305,16 +338,20 @@ DeepseekV4HCAOutput DeepseekV4HCACompressor::forward(
                     infinicore::DataType::F32)
                     ->view({1, 1, compress_rate_, head_dim_}),
                 window_shape));
+        // gate 权重：对窗口内的 rate 个位置做 softmax
         auto gate_weights = cast_to(
             infinicore::op::softmax(gate_logits, 2),
             chunk_kv->dtype());
+        // 池化：Σ_position gate_weight × kv → [batch, new_entries, head_dim]
         auto pooled = infinicore::op::sum(
             infinicore::op::mul(chunk_kv, gate_weights), {2}, false);
+        // 归一化 + RoPE，得到压缩条目
         new_compressed = kv_norm_->forward(pooled);
         new_compressed = apply_partial_rope_(
             new_compressed, cos, sin);
     }
 
+    // ⑥ 把新条目追加进累积的 compressed_kv，更新 entry_count
     auto all_compressed = new_compressed;
     if (state != nullptr) {
         if (!state->compressed_kv) {
@@ -326,6 +363,7 @@ DeepseekV4HCAOutput DeepseekV4HCACompressor::forward(
         state->entry_count += new_entries;
         all_compressed = state->compressed_kv;
     }
+    // ⑦ 构造块掩码（决定 query 能看到哪些压缩条目）
     auto block_bias = make_block_bias_(
         position_ids,
         all_compressed->size(1),

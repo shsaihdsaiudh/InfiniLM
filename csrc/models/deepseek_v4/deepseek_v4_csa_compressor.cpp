@@ -26,6 +26,7 @@
 namespace infinilm::models::deepseek_v4 {
 namespace {
 
+// cast_to：转 dtype；相同则直接返回。
 infinicore::Tensor cast_to(const infinicore::Tensor &input,
                            const infinicore::DataType &dtype) {
     if (input->dtype() == dtype) {
@@ -46,6 +47,7 @@ infinicore::Tensor broadcast_to_shape(const infinicore::Tensor &input,
         input, std::vector<int64_t>(shape.begin(), shape.end()));
 }
 
+// 生成全 -inf 的张量（用于掩码初始值）。
 infinicore::Tensor negative_infinity(
     const infinicore::Shape &shape,
     const infinicore::DataType &dtype,
@@ -62,6 +64,7 @@ infinicore::Tensor negative_infinity(
     return cast_to(cpu->to(device), dtype);
 }
 
+// 把 position_ids 拷到 CPU 的 int64 向量（掩码构造需要逐位置循环）。
 std::vector<int64_t> positions_to_host(
     const infinicore::Tensor &position_ids) {
     if (!position_ids || position_ids->ndim() != 2) {
@@ -91,6 +94,7 @@ std::vector<int64_t> positions_to_host(
     return result;
 }
 
+// partial RoPE（同 HCA/attention，输入 4 维 [B,S,heads,head_dim]）。
 infinicore::Tensor apply_partial_rope(
     const infinicore::Tensor &input,
     const infinicore::Tensor &cos,
@@ -153,6 +157,7 @@ infinicore::Tensor apply_partial_rope(
     return infinicore::op::cat({nope, rotated_typed}, 3);
 }
 
+// 校验 CSA 流状态的一致性和形状。
 void validate_stream_state(const DeepseekV4CSAStreamState &state,
                            size_t batch_size,
                            size_t projected_dim,
@@ -194,11 +199,17 @@ void validate_stream_state(const DeepseekV4CSAStreamState &state,
     }
 }
 
+// 一次压缩流的输出：全部压缩条目 + 本次新压缩的条目。
 struct CompressedStreamOutput {
     infinicore::Tensor compressed_kv;
     infinicore::Tensor new_compressed_kv;
 };
 
+// compress_stream：CSA/HCA 共用的"压缩流"核心（与 HCA 的 forward 类似）。
+// 关键不同：CSA 用【滑动窗口池化】——每个窗口的 KV 会"借用上一个窗口的最后
+// compress_rate 个 token"作为前一跳（overlap），实现窗口间的信息传递。
+// 此外 CSA 的 kv/gate 投影宽度是 2*head_dim（前 head_dim 是当前段，后 head_dim 是下一跳），
+// 池化时用"当前段 + 上一跳"拼成 2*rate 长度一起 softmax。
 CompressedStreamOutput compress_stream(
     const infinicore::Tensor &hidden_states,
     const std::shared_ptr<DeepseekV4Linear> &kv_proj,
@@ -212,9 +223,11 @@ CompressedStreamOutput compress_stream(
     size_t compress_rate,
     DeepseekV4CSAStreamState *state) {
     const size_t batch_size = hidden_states->size(0);
+    // ① 投影（宽度 2*head_dim）
     auto source_kv = kv_proj->forward(hidden_states);
     auto source_gate = gate_proj->forward(hidden_states);
     const size_t projected_dim = 2 * head_dim;
+    // ② 拼上历史 buffer
     if (state != nullptr) {
         validate_stream_state(
             *state,
@@ -231,6 +244,7 @@ CompressedStreamOutput compress_stream(
         }
     }
 
+    // ③ 可完整窗口数
     const size_t source_length = source_kv->size(1);
     const size_t usable =
         source_length / compress_rate * compress_rate;
@@ -243,6 +257,7 @@ CompressedStreamOutput compress_stream(
             "DeepSeek-V4 CSA cos/sin count does not match closed windows");
     }
 
+    // ④ 余下存回 buffer
     if (state != nullptr) {
         const size_t remainder = source_length - usable;
         state->buffer_kv = source_kv
@@ -253,6 +268,7 @@ CompressedStreamOutput compress_stream(
                                  ->contiguous();
     }
 
+    // ⑤ 滑动窗口池化
     infinicore::Tensor new_compressed;
     if (new_entries == 0) {
         new_compressed = infinicore::Tensor::empty(
@@ -260,6 +276,7 @@ CompressedStreamOutput compress_stream(
             source_kv->dtype(),
             source_kv->device());
     } else {
+        // 重排成 [new_entries, rate, 2*head_dim]
         auto chunk_kv = source_kv
                             ->narrow({{1, 0, usable}})
                             ->contiguous()
@@ -274,6 +291,7 @@ CompressedStreamOutput compress_stream(
                                       new_entries,
                                       compress_rate,
                                       projected_dim});
+        // + position_bias
         chunk_gate = infinicore::op::add(
             chunk_gate,
             broadcast_to_shape(
@@ -281,12 +299,14 @@ CompressedStreamOutput compress_stream(
                     {1, 1, compress_rate, projected_dim}),
                 chunk_gate->shape()));
 
+        // 每个窗口的后 head_dim 是"当前段"，前 head_dim 是"下一跳"（借给下一个窗口）
         auto current_kv = chunk_kv
                               ->narrow({{3, head_dim, head_dim}})
                               ->contiguous();
         auto current_gate = chunk_gate
                                 ->narrow({{3, head_dim, head_dim}})
                                 ->contiguous();
+        // "上一跳"：来自 state->overlap（上个窗口留下的前 head_dim）
         infinicore::Tensor first_kv;
         infinicore::Tensor first_gate;
         if (state != nullptr && state->overlap_kv) {
@@ -302,6 +322,7 @@ CompressedStreamOutput compress_stream(
                 source_gate->dtype(),
                 source_gate->device());
         }
+        // previous = 第一个窗口的上一跳 + 其余窗口的"自己的前 head_dim"
         auto previous_kv = first_kv;
         auto previous_gate = first_gate;
         if (new_entries > 1) {
@@ -320,16 +341,19 @@ CompressedStreamOutput compress_stream(
                      ->contiguous()},
                 1);
         }
+        // window = [previous(上一跳, rate个), current(当前段, rate个)] 拼成 2*rate 长
         auto window_kv = infinicore::op::cat(
             {previous_kv, current_kv}, 2);
         auto window_gate = infinicore::op::cat(
             {previous_gate, current_gate}, 2);
+        // 在 2*rate 长度上 softmax，加权池化
         auto weights = cast_to(
             infinicore::op::softmax(
                 cast_to(window_gate, infinicore::DataType::F32), 2),
             window_kv->dtype());
         auto pooled = infinicore::op::sum(
             infinicore::op::mul(window_kv, weights), {2}, false);
+        // 归一化 + RoPE
         new_compressed = kv_norm->forward(pooled);
         new_compressed = apply_partial_rope(
                              new_compressed->unsqueeze(2),
@@ -339,6 +363,7 @@ CompressedStreamOutput compress_stream(
                              rope_head_dim)
                              ->squeeze(2);
 
+        // 更新 overlap：最后一个窗口的前 head_dim 留给下次
         if (state != nullptr) {
             state->overlap_kv = chunk_kv
                                     ->narrow({{1, new_entries - 1, 1},
@@ -353,6 +378,7 @@ CompressedStreamOutput compress_stream(
         }
     }
 
+    // ⑥ 追加进累积条目
     auto all_compressed = new_compressed;
     if (state != nullptr) {
         if (!state->compressed_kv) {
@@ -367,6 +393,7 @@ CompressedStreamOutput compress_stream(
     return {all_compressed, new_compressed};
 }
 
+// 构造 indexer 打分的 causal 掩码（同 HCA 的块掩码）：条目号 >= 阈值的不可见。
 infinicore::Tensor causal_score_bias(
     const infinicore::Tensor &position_ids,
     size_t compressed_length,
@@ -407,6 +434,7 @@ infinicore::Tensor causal_score_bias(
     return cast_to(cpu->to(device), dtype);
 }
 
+// 把 top-k 选出的条目号中"不可见的"标记为 -1（causal 之后仍可能选到看不见的条目）。
 infinicore::Tensor mark_invalid_topk(
     const infinicore::Tensor &indices,
     const infinicore::Tensor &position_ids,
@@ -443,6 +471,7 @@ infinicore::Tensor mark_invalid_topk(
     return cpu->to(indices->device());
 }
 
+// 把选中的条目号转成块掩码：选中的条目位置为 0（可见），其余 -inf（屏蔽）。
 infinicore::Tensor make_block_bias(
     const infinicore::Tensor &indices,
     size_t compressed_length,
@@ -485,6 +514,9 @@ infinicore::Tensor make_block_bias(
 
 } // namespace
 
+// DeepseekV4IndexerScorer：Lightning Indexer 的打分器——为"每个 query 对每个压缩条目"打分，
+// 决定哪些压缩条目最值得被当前 query 关注（之后 top-k 选）。
+// 打分 = Σ_头 relu(query·compressed_kv / √d) × weights（多头的加权聚合）。
 DeepseekV4IndexerScorer::DeepseekV4IndexerScorer(
     size_t hidden_size,
     size_t num_heads,
@@ -500,6 +532,8 @@ DeepseekV4IndexerScorer::DeepseekV4IndexerScorer(
         weights_proj, hidden_size, num_heads_, dtype, device);
 }
 
+// 前向：query [B,S,H,head] 和 compressed_kv [B,entries,head] 算相关性分数，
+// 再用 weights_proj(hidden) 加权各头，聚合出每个 (query, entry) 的打分。
 infinicore::Tensor DeepseekV4IndexerScorer::forward(
     const infinicore::Tensor &query,
     const infinicore::Tensor &compressed_kv,
@@ -525,6 +559,7 @@ infinicore::Tensor DeepseekV4IndexerScorer::forward(
             infinicore::DataType::F32,
             query->device());
     }
+    // query × compressed_kv：每个 (query 位置, 每个头) 对每个条目的点积
     auto scores = infinicore::op::matmul(
                       cast_to(query, infinicore::DataType::F32)
                           ->view({batch_size,
@@ -537,9 +572,11 @@ infinicore::Tensor DeepseekV4IndexerScorer::forward(
                               sequence_length,
                               num_heads_,
                               compressed_length});
+    // relu + 缩放（只保留正向相关性）
     scores = infinicore::op::mul_scalar(
         infinicore::op::relu(scores),
         1.0 / std::sqrt(static_cast<double>(head_dim_)));
+    // weights：hidden → weights_proj → 每头一个权重，加权聚合
     auto weights = infinicore::op::mul_scalar(
                        cast_to(
                            weights_proj_->forward(hidden_states),
@@ -547,10 +584,17 @@ infinicore::Tensor DeepseekV4IndexerScorer::forward(
                        1.0 / std::sqrt(static_cast<double>(num_heads_)))
                        ->unsqueeze(3);
     weights = broadcast_to_shape(weights, scores->shape());
+    // 沿头维度加权求和 → [B, S, entries]：每个 query 对每个条目的分数
     return infinicore::op::sum(
         infinicore::op::mul(scores, weights), {2}, false);
 }
 
+// DeepseekV4Indexer：Lightning Indexer——稀疏挑选压缩条目。
+// 在 CSA 里，压缩条目可能很多，不是全看，而是：
+//   1. 用压缩器（compress_stream）把历史压成条目
+//   2. 用 scorer 为每个 query 对每个条目打分
+//   3. 加 causal 掩码 → softmax（保序）→ top-k 选出最相关的条目
+// 这对应 V4 配置 index_n_heads=64, index_head_dim=128, index_topk=512。
 DeepseekV4Indexer::DeepseekV4Indexer(
     size_t hidden_size,
     size_t q_lora_rank,
@@ -577,6 +621,7 @@ DeepseekV4Indexer::DeepseekV4Indexer(
         throw std::runtime_error(
             "DeepSeek-V4 indexer configuration is invalid");
     }
+    // 自己的压缩器（kv/gate 投影宽度 2*head_dim）+ query 投影 + scorer
     INFINICORE_NN_MODULE_INIT(
         kv_proj, hidden_size_, 2 * head_dim_, dtype, device);
     INFINICORE_NN_MODULE_INIT(
@@ -592,6 +637,7 @@ DeepseekV4Indexer::DeepseekV4Indexer(
         scorer, hidden_size_, num_heads_, head_dim_, dtype, device);
 }
 
+// 前向：压缩 → 打分 → causal掩码 → softmax → top-k → 过滤不可见条目
 DeepseekV4Indexer::Output DeepseekV4Indexer::forward(
     const infinicore::Tensor &hidden_states,
     const infinicore::Tensor &q_residual,
@@ -610,6 +656,7 @@ DeepseekV4Indexer::Output DeepseekV4Indexer::forward(
         throw std::runtime_error(
             "DeepSeek-V4 indexer hidden/query residual shape mismatch");
     }
+    // ① 用自己的压缩器压缩历史成条目
     auto compressed = compress_stream(
         hidden_states,
         kv_proj_,
@@ -624,6 +671,7 @@ DeepseekV4Indexer::Output DeepseekV4Indexer::forward(
         state);
     const size_t batch_size = hidden_states->size(0);
     const size_t sequence_length = hidden_states->size(1);
+    // ② query 投影 + RoPE
     auto query = q_b_proj_->forward(q_residual)
                      ->view({batch_size,
                              sequence_length,
@@ -635,6 +683,7 @@ DeepseekV4Indexer::Output DeepseekV4Indexer::forward(
         query_sin,
         head_dim_,
         rope_head_dim_);
+    // ③ 打分
     auto scores = scorer_->forward(
         query, compressed.compressed_kv, hidden_states);
     const size_t compressed_length = compressed.compressed_kv->size(1);
@@ -646,6 +695,7 @@ DeepseekV4Indexer::Output DeepseekV4Indexer::forward(
             infinicore::DataType::I32,
             hidden_states->device());
     } else {
+        // ④ causal 掩码（看不到未来的条目）
         scores = infinicore::op::add(
             scores,
             causal_score_bias(
@@ -654,20 +704,22 @@ DeepseekV4Indexer::Output DeepseekV4Indexer::forward(
                 compress_rate_,
                 scores->dtype(),
                 scores->device()));
-        // The CUDA top-k backend can discard valid candidates when every
-        // finite value in a row is negative.  Softmax is order preserving,
-        // maps finite candidates to positive values, and keeps causally
-        // masked -inf entries at zero.
+        // ⑤ 保序 softmax：规避 CUDA top-k 在全负数行漏选的边界问题。
+        //    softmax 保持顺序、把有限候选映射成正数、causal 的 -inf 保持 0 概率。
         scores = infinicore::op::softmax(scores, 2);
+        // ⑥ top-k 选条目
         indices = infinicore::op::topk(
                       scores, top_k, 2, true, true)
                       .second;
+        // ⑦ 把不可见的条目号标记为 -1（causal 屏蔽后仍可能混入）
         indices = mark_invalid_topk(
             indices, position_ids, compress_rate_);
     }
     return {indices, compressed.compressed_kv};
 }
 
+// DeepseekV4CSACompressor：CSA 压缩器（4 倍压缩 + Lightning Indexer 稀疏挑选）。
+// = compress_stream（压缩历史成条目） + indexer（挑出每个 query 最相关的 top-k 条目）。
 DeepseekV4CSACompressor::DeepseekV4CSACompressor(
     size_t hidden_size,
     size_t q_lora_rank,
@@ -696,6 +748,7 @@ DeepseekV4CSACompressor::DeepseekV4CSACompressor(
         throw std::runtime_error(
             "DeepSeek-V4 CSA compressor configuration is invalid");
     }
+    // 自己的压缩器（给注意力用的，head_dim = attention_head_dim）
     INFINICORE_NN_MODULE_INIT(
         kv_proj, hidden_size_, 2 * attention_head_dim_, dtype, device);
     INFINICORE_NN_MODULE_INIT(
@@ -705,6 +758,7 @@ DeepseekV4CSACompressor::DeepseekV4CSACompressor(
         ({compress_rate_, 2 * attention_head_dim_}, dtype, device));
     INFINICORE_NN_MODULE_INIT(
         kv_norm, attention_head_dim_, rms_norm_eps, dtype, device);
+    // 嵌套一个 indexer（它内部有自己的压缩器 + scorer）
     INFINICORE_NN_MODULE_INIT(
         indexer,
         hidden_size_,
@@ -719,6 +773,7 @@ DeepseekV4CSACompressor::DeepseekV4CSACompressor(
         device);
 }
 
+// 前向：压缩出全部条目 + 用 indexer 选出每个 query 的 top-k 条目 + 块掩码
 DeepseekV4CSAOutput DeepseekV4CSACompressor::forward(
     const infinicore::Tensor &hidden_states,
     const infinicore::Tensor &q_residual,
@@ -740,6 +795,7 @@ DeepseekV4CSAOutput DeepseekV4CSACompressor::forward(
         throw std::runtime_error(
             "DeepSeek-V4 CSA compressor input shape mismatch");
     }
+    // ① 用注意力侧的压缩器压缩历史成条目
     auto compressed = compress_stream(
         hidden_states,
         kv_proj_,
@@ -752,6 +808,7 @@ DeepseekV4CSAOutput DeepseekV4CSACompressor::forward(
         rope_head_dim_,
         compress_rate_,
         state == nullptr ? nullptr : &state->compressor);
+    // ② 用 indexer 选出每个 query 的 top-k 条目
     auto index = indexer_->forward(
         hidden_states,
         q_residual,
@@ -761,11 +818,13 @@ DeepseekV4CSAOutput DeepseekV4CSACompressor::forward(
         compressed_sin,
         position_ids,
         state == nullptr ? nullptr : &state->indexer);
+    // ③ 校验压缩条目数一致（压缩器与 indexer 各自累积，必须同步）
     if (index.compressed_kv->size(1)
         != compressed.compressed_kv->size(1)) {
         throw std::runtime_error(
             "DeepSeek-V4 CSA compressor/indexer histories diverged");
     }
+    // ④ 把选中的条目转成块掩码（选中=0可见，其余=-inf）
     auto block_bias = make_block_bias(
         index.topk_indices,
         compressed.compressed_kv->size(1),
