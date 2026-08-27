@@ -468,3 +468,41 @@ NaN/Inf 检查和 4-token decode。服务器规格、B200/B300 `sm_100f` 构建�
 
 本期不做：TP/EP/PP 实现、昇腾真权重、CPU 全量真权重、自费租卡、
 DSpark 投机路径、长上下文实测、CUDA Graph 生产化。
+
+## MXFP4 fused MoE 微基准（2026-08-27，RTX 5090）
+
+提前执行冲刺表中的性能微基准项（改在租用的 RTX 5090 而非本地 5060 Ti，
+因 5090 环境已就绪；sm_120、CUDA 12.8、torch 2.6.0a0 NGC）。
+脚本：`test/bench/bench_fused_moe_mxfp4.py`（可直接复跑）。
+
+方法：真实 V4 MoE 形状（E=256、H=4096、I=2048、topk=6、bf16 激活、
+SwigluLimit10），随机打包 FP4 权重（seed 固定）；对照组为"解量化后
+常驻 bf16 权重 + 按专家分组 GEMM"的分解实现，两者有效权重逐位一致，
+差异只来自 kernel 路径与访存。正确性门：T=8 与逐路由 fp32 参照对拍。
+
+结果：
+
+- 权重常驻显存：MXFP4 3.19 GiB vs bf16 12.00 GiB（3.76x，等于解析值
+  (0.5+1/32)/2）；
+- 数值：|ref|max=1.9e4，fused 相对误差 3.3e-3，bf16 基线 6.6e-3——
+  均在 bf16 舍入量级内，且 fused（fp32 内部点积）比 bf16 基线更接近
+  fp32 参照，真实形状下数值无误；
+- 延迟（每层 MoE 单次前向）：
+
+| tokens | fused | bf16 分解基线 | speedup |
+|---|---|---|---|
+| 1 | 1.36 ms | 6.97 ms | 5.14x |
+| 8 | 10.79 ms | 12.09 ms | 1.12x |
+| 32 | 43.18 ms | 24.54 ms | 0.57x |
+| 128 | 172.92 ms | 39.35 ms | 0.23x |
+| 512 | 693.08 ms | 41.53 ms | 0.06x |
+| 2048 | 2774.77 ms | 42.41 ms | 0.02x |
+| 8192 | 11101.15 ms | 44.40 ms | 0.004x |
+
+结论：现 fused_moe_mxfp4 kernel 是"每 (route, 输出元素) 一个 block"
+的 decode 向实现——T 个 token 的每条 route 都独立重读对应专家整份
+w13（约 4 MiB），权重访存随 T×topk 线性放大（T=8192 时约 200 GiB 级），
+因此 decode 段受益（只读 3.2 GiB FP4 而非 12 GiB bf16，快 5.1x）而
+prefill 段结构性不适用。clamped SwiGLU（本项目新增部分）不是瓶颈。
+V4 服务化部署时 prefill 应走分组 GEMM 路径，或为 kernel 增加专家分组
+tiling（后续优化方向，本期不做）。
