@@ -424,3 +424,47 @@ base loader 丢弃 `mtp.*`，dense FP8 转 BF16 后估算常驻参数 150.756 Gi
 NaN/Inf 检查和 4-token decode。服务器规格、B200/B300 `sm_100f` 构建命令和
 通过标准见 `dev_dsv4/server_validation.md`。至此剩余唯一无法在本机完成的动作是
 租用一张满足显存门槛的服务器并执行该真权重命令。
+
+
+---
+
+## 路线调整与冲刺计划（2026-08-27）
+
+触发：B200/B300 市场无货，2×96GB 同宿主机双卡货源不稳定；立项书 §5.1
+显存项 Go/No-Go 死线（8/27）到达，按规则把"真权重 43 层全量生成"降为
+冲刺项。结题主交付回到 tiny 全机制正确性 + 无损转换器 + 可复现 gap。
+
+已完成的方案评估（结论存档）：
+
+- 6×32GB 拼卡：不可行。专家 EP 均分后每卡约 35.8 GiB（含 dense 复制）
+  超过 32 GB，且需为 V4 新写 EP/TP，工作量 1~2 周；
+- 2×96GB PP=2：技术可行（kimi_k3 有完整 PP 先例，V4 改造点已清单化，
+  切分后每卡约 76~79 GiB 有余量），但需自费且对本项目目标边际价值低，
+  放弃，改造点清单保留备查；
+- 昇腾真权重：不可行。ModelArts 实例规格中 "192 GiB" 是主机内存，
+  ascend-snt9b3（910B3）HBM 仅 64GB；ascend 后端无端到端模型先例，
+  `fused_moe_mxfp4` 需从零写 Ascend kernel，估算 2.5~4 周超出剩余工期；
+- CPU 全量真权重（大内存 ECS）：可行但价值/成本比低，本期取消，
+  不再保留为机会项。
+
+冲刺计划（8/27 → 9/20）：
+
+| 日期 | 事项 | 产出 |
+|---|---|---|
+| 8/27–8/30 | PR 可合入化：tiny 端到端对拍迁入 `test/models/deepseek_v4/` 正式 pytest；全量回归绿；InfiniCore `feat/mxfp4-clamped-swiglu` 整理为可评审 | 双仓可评审 PR 状态 |
+| 8/31–9/1 | 昇腾 Go/No-Go（代金券租机，优先 x86 主机）：ascend 构建 + add/gemm/rms_norm 三项 `--ascend` 实测；两天不过则放弃昇腾转入性能轨道 | 环境结论 |
+| 9/2–9/10 | 昇腾 tiny 支持：新写 11 个 aclnn 算子封装（broadcast_to/mul/mul_scalar/softmax/sum/relu/sigmoid/reciprocal/topk/fmin/silu）+ infiniop 原生 cast（aclnnCast，替代 ATen 接线）+ cat 白名单一行；tiny 模型昇腾对拍。tiny 走 dense 专家路径（`expert_dtype` 默认 dense），不需要 mxfp4 kernel | InfiniCore 昇腾算子 PR + 双平台 tiny 对拍记录 |
+| 并行 | 性能微基准（本地 5060 Ti，零成本）：fused_moe_mxfp4 真实 shape 下 fused vs 解量化+GEMM 对照、roofline 分析 | 性能数据 |
+| 9/11–9/14 | 深度抽样真权重对拍（本地，零租金）：下载 2~4 个真实 shard，抽样组装覆盖 sliding/CSA/HCA/hash-MoE 全部层型的减深度模型 + 真实 embedding/lm_head，与同样截断的 HF 参照实现对拍 logits；显存不足时走 CPU fused_moe_mxfp4 | 真权重数值证据（深度抽样） |
+| 9/15–9/20 | 全量回归、文档、最终报告（三档状态：已通过/仅 tiny 通过/未实现） | 报告 + PR |
+
+止损与降级规则：
+
+- 昇腾环境 9/1 不过关 → 主线切性能轨道，昇腾沉没成本控制在 2 天；
+- 昇腾算子补齐但 9/8 模型对拍卡住 → 只提算子 PR（基础设施分照拿），
+  模型对拍标注未完成进报告；
+- 深度抽样对拍若暴露真权重数值问题 → 9/15 前集中修复，仍不行则在
+  报告中如实记录残差量级与定位。
+
+本期不做：TP/EP/PP 实现、昇腾真权重、CPU 全量真权重、自费租卡、
+DSpark 投机路径、长上下文实测、CUDA Graph 生产化。
