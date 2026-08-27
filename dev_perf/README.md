@@ -31,6 +31,9 @@ InfiniLM 侧常用参数：
 - `--attn-backend flash-attn`：prefill/decode 改用 FlashAttention-2（需
   ATen+FA 版 InfiniCore，见 gap_analysis.md v4 的构建与 `INFINI_ROOT`
   用法）。长 prefill 负载收益 ~20~30%。
+- `--attn-backend hybrid`：prefill 走 FA2 varlen、decode 走自研 paged
+  kernel（经 strides 直读 FA 的 BSHD cache）的分离路由。5090 上为最优
+  单配置（见 gap_analysis.md v9）。
 - `--only w2_long_prefill`：只跑指定负载（逗号分隔）。
 - `--dump-outputs`：把每个请求的输出 token ids 记入 JSON，配合
   `compare_outputs.py a.json b.json ...` 做跨引擎/跨 backend 的贪心解码

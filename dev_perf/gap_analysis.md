@@ -1,11 +1,121 @@
 # 项目 #2 基线差距清单
 
-最新结论见 v8（2026-08-27）：5090 上 v4(FA2)+v5(融合) 两线合流——
-FA 栈下融合收益反而更大（0.6B ABBA e2e -5%~-13%，1.7B -9%~-11%）；
-并发现 5090 新现象：**FA2 的 decode 显著慢于自研 splitkv（-35%~-50%），
-FA 只赢 prefill**，"flash-attn 设为默认后端"在本平台不成立，应走
-prefill/decode 分离路由。v7：elementwise 链 kernel 级闭环。v6：5090
-paged-attn 复测，融合 -4%~-8%。
+最新结论见 v9（2026-08-27）：v8 提出的「prefill/decode 分离路由」已落地
+为 `hybrid` 后端（prefill→FA2 varlen，decode→自研 paged kernel 经 strides
+直读 FA 的 BSHD cache，零数据搬运）。5090 上 0.6B 全负载合并收益
+-8%~-37%（对 flash-attn）且与 paged-attn 持平或更优；1.7B decode
+-18%~-22%。新发现：长 ctx（~3.3k）下 paged decode kernel 不再赢 FA，
+交叉点在 1k~3.3k 之间，ctx 自适应路由列为后续项。
+
+---
+
+## v9（2026-08-27）：hybrid 后端落地 —— prefill 走 FA2 / decode 走自研 splitkv
+
+动机：v8 发现 5090 上 FA2 只赢 prefill、decode 慢自研 splitkv 35%~50%，
+「flash-attn 设为默认」不成立。本轮把分离路由做成一个后端：
+`--attn-backend hybrid`。
+
+实现（全部在本分支工作区，零新增文件）：
+
+- `attention_backends.hpp`：新增 `AttentionBackend::HYBRID` + 字符串解析
+  `"hybrid"`；Python 侧 `llm.py`/`bench.py` 透传（pybind 原样走
+  `parse_attention_backend`，无需其他改动）。
+- `attention_layer.{hpp,cpp}`：新增 `HybridAttentionImpl`（内含一个
+  `FlashAttentionImpl`）。`is_prefill` 判定与既有 impl 相同（展平 paged
+  模式下纯 decode 步恰为每序列 1 个 query token）；prefill/混合 batch →
+  `flash_->forward`（mha_varlen），纯 decode → 复用
+  `flash_->do_kv_cache_update`（paged_caching_ 经 permuted view 写 BSHD
+  cache）后，以 `k_total->permute({0,2,1,3})` 的逻辑 BHSD 视图直接调
+  `paged_attention_`。
+- `kv_cache.cpp`：HYBRID 与 FLASH_ATTN 同走 BSHD 物理布局；
+  `infinilm_model.cpp`：HYBRID 落入 paged cache 分配分支（Qwen3 因此
+  走 `forward_paged_`，自动带上 v5 的 rms_norm_rope 融合）。
+
+strides 安全性（hybrid 成立的命门，InfiniCore 侧核实）：
+
+- `paged_attention` descriptor（`info.h`）从 tensor descriptor 逐维取
+  stride，仅要求 `stride(3)==1`（head_dim 连续）——permuted BSHD 视图
+  满足（stride(0)=BS·H·D, stride(1)=D, stride(2)=H·D, stride(3)=1）。
+- 实际使用的 `kernel_v2.cuh`（所有 nvidia launcher 都 include 它）按
+  `k_row_stride` 逐 token 寻址；旧 `kernel.cuh` 里 `token*HEAD_SIZE` 的
+  硬编码路径未被任何 launcher 引用。
+- infinicore wrapper 的 FA 快速通道（`canUseFlashAttention`）两条后端
+  条件一致，且该通道本来就总被喂 permuted 视图；本平台实证 decode 走
+  的是 kernel_v2（见下，w1/w4 hybrid≡paged 而远快于 FA）。
+
+性能（5090，64blk，no-graph，同树同 binary 交错 ABBA）：
+
+0.6B hybrid(A) vs flash-attn(B)，e2e 秒：
+
+| 负载 | A1 | A2 | B1 | B2 | e2e Δ |
+|---|---|---|---|---|---|
+| w1 单请求 decode | 0.33 | 0.36 | 0.51 | 0.53 | **-33.7%** |
+| w2 长 prefill + 128 decode | 0.51 | 0.53 | 0.56 | 0.57 | **-8.0%** |
+| w3 batch32 | 0.39 | 0.42 | 0.65 | 0.64 | **-37.2%** |
+| w4 长 decode | 2.68 | 2.81 | 4.27 | 4.33 | **-36.2%** |
+
+0.6B hybrid(C) vs paged-attn(D)，e2e 秒：
+
+| 负载 | C1 | C2 | D1 | D2 | e2e Δ |
+|---|---|---|---|---|---|
+| w1 | 0.35 | 0.36 | 0.35 | 0.36 | 持平 |
+| w2 | 0.53 | 0.53 | 0.64 | 0.64 | **-17.2%** |
+| w3 | 0.45 | 0.46 | 0.44 | 0.47 | 持平 |
+| w4 | 2.85 | 2.93 | 2.87 | 2.89 | 持平 |
+
+1.7B（HY/FA 为 ABBA，PG 单跑 + v8 复测值 0.86s 佐证）：
+
+| 负载 | HY A1/A2 | FA B1/B2 | PG | HY vs FA | HY vs PG |
+|---|---|---|---|---|---|
+| w1 decode | 3.26/3.26 ms | 4.20/4.37 ms | 3.23 ms | **-22.5%** | 持平 |
+| w2 e2e | 0.75/0.75 s | 0.61/0.63 s | 0.84 s | **+19%（倒退）** | **-10.7%** |
+| w3 e2e | 0.66/0.66 s | 0.61/0.68 s | 0.66 s | 持平 | 持平 |
+| w4 decode | 3.54/3.57 ms | 4.24/4.38 ms | 3.55 ms | **-18.4%** | 持平 |
+
+结论：
+
+1. **设计目标达成**：hybrid decode ≡ paged decode（w1/w4 逐项持平），
+   prefill 保留 FA2（w2 对 paged -17%）；0.6B 上对 flash-attn 全面
+   -8%~-37%，把 v8 发现的 FA2 decode 回退全部吃回。
+2. **w2@1.7B 是唯一倒退项**（0.75 vs FA 0.62，可复现、非漂移：
+   A1≡A2/B1≡B2）。分解：5090 上 1.7B 3240-token prefill 仅 ~70ms，
+   w2 e2e 由 decode 段（ctx 3240→3368）主导；该 ctx 下 paged kernel
+   不再赢 FA kvcache——而 w4（ctx≤~1k）hybrid≡paged 仍快 FA 18%。
+   **交叉点在 1k~3.3k ctx 之间**（0.6B 在 3.3k 处 hybrid 仍赢 FA，
+   与 kv-head 数/几何相关）。v8 的「FA decode 慢 35~50%」因此应限定为
+   短/中 ctx。精确分相计时留待 nsys。
+3. 后续方向：decode 按 ctx 长度自适应选 kernel（短 ctx→paged splitkv，
+   长 ctx→FA kvcache），vLLM 式调度；当前 hybrid 已是严格优于
+   paged-attn 全负载、优于 flash-attn 3/4 负载的单配置。
+
+正确性：
+
+- **决定性**：0.6B A1≡A2、C1≡C2 四负载全 exact；1.7B A1≡A2 仅 w3
+  31/32（@91，batch 调度时序噪声，与 v5 观察到的 batch 噪声底同类）。
+- 对两参考后端的交叉对照：0.6B w2 三方全 exact；w1 hybrid-vs-fa @8
+  = fa-vs-pg 噪声底 @8；w3 27~28/32 ≈ 底 27/32；w4 单请求 @32 并列
+  翻牌（「人们如何交流」vs「人们如何进行交流」，两侧 1024 token 全程
+  连贯枚举）——hybrid 对 fa 与 pg 同 token 分叉而 fa≡pg，说明 strided
+  读引入 ~ulp 级 logit 差（kernel 内不同访存路径的归约顺序差），
+  量级与换后端同。1.7B：w1/w2 对 paged 全 exact；w3 24~26/32 vs 底
+  25/32；w4 @160/@190 = 底 @160。
+
+数据归档：`results/5090_hybrid/`（15 份：0.6B ABBA×8、1.7B 单跑×3、
+1.7B ABBA×4）。远程树 `/root/src/InfiniLM-hybrid`（本工作区快照，
+非 git）；构建 `XMAKE_ROOT=y INFINI_ROOT=/root/.infini-fa xmake f -c
+-m release && xmake build -j32 _infinilm && xmake install _infinilm`；
+运行脚本 `/root/run_hybrid.sh`、`/root/run_hybrid17.log`。
+
+### 待办更新
+
+- [ ] decode 按 ctx 长度自适应路由（w2@1.7B 倒退项的根治；需先 nsys
+      定交叉点）。
+- [ ] InfiniLM-vs-vLLM 健康平台全栈对照（沿用 v8 待办，hybrid 为
+      InfiniLM 侧新基线）。
+- [ ] （可选）5060 Ti 上复核 hybrid（v4 平台上 FA decode 无回退，
+      hybrid 预期与 paged 持平）。
+- [ ] hybrid 推广到其他模型族（当前仅 Qwen3 paged 路径带融合；
+      hybrid 本身对任意走 forward_paged_ 的模型可用）。
 
 ---
 

@@ -65,6 +65,9 @@ std::vector<infinicore::Tensor> InfinilmModel::default_allocate_kv_cache_tensors
     case backends::AttentionBackend::FLASH_ATTN: {
         ;
     }
+    case backends::AttentionBackend::HYBRID: {
+        ;
+    }
     case backends::AttentionBackend::PAGED_ATTN: {
         auto paged_kv_cache_config = dynamic_cast<const cache::PagedKVCacheConfig *>(cache_config);
         if (nullptr == paged_kv_cache_config) {

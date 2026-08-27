@@ -161,7 +161,7 @@ def main():
     parser.add_argument(
         "--attn-backend",
         default="paged-attn",
-        choices=["default", "static-attn", "paged-attn", "flash-attn", "flashinfer"],
+        choices=["default", "static-attn", "paged-attn", "flash-attn", "flashinfer", "hybrid"],
         help="infinilm only: attention backend",
     )
     parser.add_argument(

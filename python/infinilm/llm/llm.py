@@ -384,7 +384,7 @@ class LLM:
             top_p: Default top-p sampling parameter.
             top_k: Default top-k sampling parameter.
             enable_graph: Whether to enable graph compiling.
-            attn_backend: Attention backend to use ('default', 'flash-attn').
+            attn_backend: Attention backend to use ('default', 'static-attn', 'paged-attn', 'flash-attn', 'flashinfer', 'hybrid'). 'hybrid' = FA2 for prefill, paged kernel for decode.
             use_mla: Whether to use DeepSeek V2 MLA attention when supported.
             weight_load_mode: Weight loading mode across tensor-parallel workers.
         """
@@ -612,7 +612,7 @@ class AsyncLLMEngine:
             top_p: Default top-p sampling parameter.
             top_k: Default top-k sampling parameter.
             enable_graph: Whether to enable graph compiling.
-            attn_backend: Attention backend to use ('default', 'flash-attn').
+            attn_backend: Attention backend to use ('default', 'static-attn', 'paged-attn', 'flash-attn', 'flashinfer', 'hybrid'). 'hybrid' = FA2 for prefill, paged kernel for decode.
             kv_connector: KV connector type ('MooncakeConnector').
             kv_role: Role in KV connector ('kv_producer' or 'kv_consumer').
             kv_connector_extra_config: Extra config dict for KV connector.

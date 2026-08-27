@@ -10,7 +10,42 @@
 #include <variant>
 
 namespace infinilm::layers::attention {
-using AttentionImpl = std::variant<std::shared_ptr<backends::StaticAttentionImpl>, std::shared_ptr<backends::PagedAttentionImpl>, std::shared_ptr<backends::FlashAttentionImpl>>;
+
+class AttentionLayer;
+
+namespace backends {
+
+/**
+ * @brief Hybrid attention: prefill (and mixed batches) go to FlashAttention-2
+ * varlen; pure decode steps reuse FA's paged cache update (BSHD layout) but
+ * run the paged-attention decode kernel, which reads the BSHD cache via
+ * strides and is faster than FA2's kvcache path at short/medium contexts.
+ */
+class HybridAttentionImpl {
+public:
+    HybridAttentionImpl(size_t num_heads,
+                        size_t head_size,
+                        float scale,
+                        size_t num_kv_heads,
+                        size_t layer_idx);
+
+    infinicore::Tensor forward(const AttentionLayer &layer,
+                               const infinicore::Tensor &query,
+                               const infinicore::Tensor &key,
+                               const infinicore::Tensor &value,
+                               infinicore::Tensor &kv_cache,
+                               const infinilm::global_state::AttentionMetadata &attn_metadata) const;
+
+private:
+    std::shared_ptr<FlashAttentionImpl> flash_;
+    size_t num_heads_;
+    size_t head_size_;
+    float scale_;
+};
+
+} // namespace backends
+
+using AttentionImpl = std::variant<std::shared_ptr<backends::StaticAttentionImpl>, std::shared_ptr<backends::PagedAttentionImpl>, std::shared_ptr<backends::FlashAttentionImpl>, std::shared_ptr<backends::HybridAttentionImpl>>;
 
 /**
  * @brief Attention layer.
