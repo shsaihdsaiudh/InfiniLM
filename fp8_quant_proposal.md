@@ -1,7 +1,7 @@
 # FP8 块量化权重执行路径 — 立项草案
 
 > 项目方向:训练营项目 #4(量化与低精度推理)
-> 状态:W1–W2 已完成(算子 + 加载泛化 + Qwen3-8B-FP8 端到端验证通过);W3 精度评测、W4 性能迭代为后续工作
+> 状态:W1–W3 已完成(W3 于 5090 复测:wikitext2 PPL 偏差 0.082% 达标;decode 31% BF16 未达标,差距已量化 → W4 融合 GEMM 依据,详见 dev_fp8/w3_eval_report.md);W4 性能迭代为后续工作
 > 分支:feat/fp8-blockwise-quantization(配套 InfiniCore 分支 feat/fp8-blockwise-dequantize;worktree: ../InfiniLM-fp8)
 > 日期:2026-08-23
 

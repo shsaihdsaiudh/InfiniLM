@@ -1,0 +1,8 @@
+{
+  "model": "/data/huggingface_home/hub/models--Qwen--Qwen3-8B/snapshots/b968826d9c46dd6066d109eabc6255188de91218",
+  "chunk": 512,
+  "chunks": 2886,
+  "tokens": 293457,
+  "nll": 861922.3377223015,
+  "ppl": 18.861698607190057
+}

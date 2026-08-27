@@ -1,0 +1,58 @@
++ source /root/fp8/fp8_env.sh
+++ export INFINI_ROOT=/root/fp8/.infini
+++ INFINI_ROOT=/root/fp8/.infini
+++ export LD_LIBRARY_PATH=/root/fp8/.infini/lib
+++ LD_LIBRARY_PATH=/root/fp8/.infini/lib
+++ export PYTHONPATH=/root/fp8/InfiniCore/python:/root/fp8/InfiniLM/python
+++ PYTHONPATH=/root/fp8/InfiniCore/python:/root/fp8/InfiniLM/python
+++ export HF_HOME=/data/huggingface_home
+++ HF_HOME=/data/huggingface_home
+++ export HF_HUB_CACHE=/data/huggingface_home/hub
+++ HF_HUB_CACHE=/data/huggingface_home/hub
+++ export HF_ENDPOINT=https://hf-mirror.com
+++ HF_ENDPOINT=https://hf-mirror.com
+++ export HF_HUB_DISABLE_XET=1
+++ HF_HUB_DISABLE_XET=1
++ export HF_HUB_OFFLINE=1
++ HF_HUB_OFFLINE=1
++ cd /root/fp8/InfiniLM
++ FP8=/data/huggingface_home/hub/models--Qwen--Qwen3-8B-FP8/snapshots/220b46e3b2180893580a4454f21f22d3ebb187d3
++ BF16=/data/huggingface_home/hub/models--Qwen--Qwen3-8B/snapshots/b968826d9c46dd6066d109eabc6255188de91218
++ run FP8 /data/huggingface_home/hub/models--Qwen--Qwen3-8B-FP8/snapshots/220b46e3b2180893580a4454f21f22d3ebb187d3 1 128 256
++ local tag=FP8 model=/data/huggingface_home/hub/models--Qwen--Qwen3-8B-FP8/snapshots/220b46e3b2180893580a4454f21f22d3ebb187d3 bs=1 ilen=128 olen=256
++ echo '===== PERF FP8 bs=1 in=128 out=256 ====='
+===== PERF FP8 bs=1 in=128 out=256 =====
++ grep -E 'Prefill TTFT|Decode  Avg ITL|load weights over|PERF'
++ timeout 900 python3 examples/bench.py --model /data/huggingface_home/hub/models--Qwen--Qwen3-8B-FP8/snapshots/220b46e3b2180893580a4454f21f22d3ebb187d3 --batch-size 1 --input-len 128 --output-len 256 --enable-paged-attn --warmup
+ load weights over! 2697.826147079468 ms 
+ Prefill TTFT: 43.84 ms  Throughput: 2919.95 tok/s
+ Decode  Avg ITL: 35.09 ms   Throughput: 28.49 tok/s
++ run FP8 /data/huggingface_home/hub/models--Qwen--Qwen3-8B-FP8/snapshots/220b46e3b2180893580a4454f21f22d3ebb187d3 16 128 256
++ local tag=FP8 model=/data/huggingface_home/hub/models--Qwen--Qwen3-8B-FP8/snapshots/220b46e3b2180893580a4454f21f22d3ebb187d3 bs=16 ilen=128 olen=256
++ echo '===== PERF FP8 bs=16 in=128 out=256 ====='
+===== PERF FP8 bs=16 in=128 out=256 =====
++ timeout 900 python3 examples/bench.py --model /data/huggingface_home/hub/models--Qwen--Qwen3-8B-FP8/snapshots/220b46e3b2180893580a4454f21f22d3ebb187d3 --batch-size 16 --input-len 128 --output-len 256 --enable-paged-attn --warmup
++ grep -E 'Prefill TTFT|Decode  Avg ITL|load weights over|PERF'
+ load weights over! 2684.174060821533 ms 
+ Prefill TTFT: 218.5 ms  Throughput: 9373.06 tok/s
+ Decode  Avg ITL: 37.43 ms   Throughput: 427.44 tok/s
++ run BF16 /data/huggingface_home/hub/models--Qwen--Qwen3-8B/snapshots/b968826d9c46dd6066d109eabc6255188de91218 1 128 256
++ local tag=BF16 model=/data/huggingface_home/hub/models--Qwen--Qwen3-8B/snapshots/b968826d9c46dd6066d109eabc6255188de91218 bs=1 ilen=128 olen=256
++ echo '===== PERF BF16 bs=1 in=128 out=256 ====='
+===== PERF BF16 bs=1 in=128 out=256 =====
++ timeout 900 python3 examples/bench.py --model /data/huggingface_home/hub/models--Qwen--Qwen3-8B/snapshots/b968826d9c46dd6066d109eabc6255188de91218 --batch-size 1 --input-len 128 --output-len 256 --enable-paged-attn --warmup
++ grep -E 'Prefill TTFT|Decode  Avg ITL|load weights over|PERF'
+ load weights over! 5066.779136657715 ms 
+ Prefill TTFT: 18.19 ms  Throughput: 7038.08 tok/s
+ Decode  Avg ITL: 10.83 ms   Throughput: 92.34 tok/s
++ run BF16 /data/huggingface_home/hub/models--Qwen--Qwen3-8B/snapshots/b968826d9c46dd6066d109eabc6255188de91218 16 128 256
++ local tag=BF16 model=/data/huggingface_home/hub/models--Qwen--Qwen3-8B/snapshots/b968826d9c46dd6066d109eabc6255188de91218 bs=16 ilen=128 olen=256
++ echo '===== PERF BF16 bs=16 in=128 out=256 ====='
+===== PERF BF16 bs=16 in=128 out=256 =====
++ timeout 900 python3 examples/bench.py --model /data/huggingface_home/hub/models--Qwen--Qwen3-8B/snapshots/b968826d9c46dd6066d109eabc6255188de91218 --batch-size 16 --input-len 128 --output-len 256 --enable-paged-attn --warmup
++ grep -E 'Prefill TTFT|Decode  Avg ITL|load weights over|PERF'
+ load weights over! 4919.672966003418 ms 
+ Prefill TTFT: 197.69 ms  Throughput: 10359.5 tok/s
+ Decode  Avg ITL: 12.27 ms   Throughput: 1304.1 tok/s
++ echo PERF_BENCH_DONE
+PERF_BENCH_DONE
