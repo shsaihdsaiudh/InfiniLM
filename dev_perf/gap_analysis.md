@@ -1,9 +1,217 @@
 # 项目 #2 基线差距清单
 
-最新结论见 v5（2026-08-24）：第二优化项之一落地——融合 per-head
-RMSNorm+RoPE（新增 `rms_norm_rope` 算子，已接入 Qwen3 paged 路径），
-0.6B 交错 ABBA e2e 收益 -4%~-23%，三层正确性证据齐备。注意本轮在
-8GB WSL2 机上完成（非 v1~v4 的 16GB 5060 Ti），收益量级待 16GB 机复测。
+最新结论见 v8（2026-08-27）：5090 上 v4(FA2)+v5(融合) 两线合流——
+FA 栈下融合收益反而更大（0.6B ABBA e2e -5%~-13%，1.7B -9%~-11%）；
+并发现 5090 新现象：**FA2 的 decode 显著慢于自研 splitkv（-35%~-50%），
+FA 只赢 prefill**，"flash-attn 设为默认后端"在本平台不成立，应走
+prefill/decode 分离路由。v7：elementwise 链 kernel 级闭环。v6：5090
+paged-attn 复测，融合 -4%~-8%。
+
+---
+
+## v8（2026-08-27）：5090 全栈合流 —— FA2 + rms_norm_rope 融合
+
+动机：v4（FA2）与 v5（rms_norm_rope 融合）此前分别在 16GB 5060 Ti 和
+8GB 病态机上验证，从未在同一健康平台上叠加。本轮在 5090 上构建
+FA 版 InfiniCore（aten=y，装到 `/root/.infini-fa`），两份 InfiniLM
+扩展（fused/unfused）重建对准该库，跑 flash-attn 后端的 ABBA。
+
+构建要点（在 v6 复现要点之上新增）：
+
+- FA 源码用 **pypi sdist**（`pip download flash-attn==2.7.4.post1
+  --no-binary :all:`，阿里云镜像可达）：自带裁剪版 cutlass，够 FA 用。
+- FA 的 cute 头文件包含路径：VM 侧给 `xmake/nvidia.lua` 的
+  flash-attn-nvidia target 补了一行 `FLASH_ATTN_ROOT/csrc/cutlass/include`
+  （上游 FA target 只加 csrc/flash_attn，此前依赖外部 CUTLASS_ROOT——
+  值得上游化）。
+- **不要** export 空的 `CUTLASS_ROOT`（`os.getenv` 返回 "" ≠ nil，会误开
+  ENABLE_CUTLASS_API，scaled_mm 在裁剪版 cutlass 上编译不过）。
+- FA bwd kernel 单文件 nvcc 峰值内存大：-j24 触发 OOM（cicc signal 9），
+  **-j6** 通过；全量约 25min（含 FA 84 .cu）。
+- aten=y 后 InfiniLM 两份扩展需对准 `/root/.infini-fa` 重建（C++ ABI
+  一致性）。
+
+### 0.6B flash-attn 交错 ABBA（e2e 秒）
+
+| 负载 | A1 未融合 | A2 未融合 | B1 融合 | B2 融合 | e2e Δ |
+|---|---|---|---|---|---|
+| w1 单请求 decode | 0.59 | 0.60 | 0.53 | 0.54 | **-10.1%** |
+| w2 长 prefill + 128 decode | 0.65 | 0.68 | 0.58 | 0.58 | **-12.8%** |
+| w3 batch32 | 0.68 | 0.69 | 0.65 | 0.65 | **-5.1%** |
+| w4 长 decode | 4.73 | 4.79 | 4.34 | 4.38 | **-8.4%** |
+
+### 1.7B flash-attn 单跑对照
+
+| 负载 | 未融合 | 融合 | Δ |
+|---|---|---|---|
+| w1 单请求 decode | 4.77 ms/tok | 4.33 ms/tok | **-9.3%** |
+| w2 长 prefill + 128 decode | 0.71s | 0.63s | **-11.3%** |
+| w3 batch32 | 5745 tok/s | 6006 tok/s | **+4.5%** |
+| w4 长 decode | 4.81 ms/tok | 4.38 ms/tok | **-8.8%** |
+
+**融合收益在 FA 栈下比在 paged-attn 栈下更大**（对比 v6：0.6B
+-4%~-8% → 本轮 -5%~-13%；1.7B -1%~-4% → -9%~-11%）。机制自洽：
+attention 被 FA 压快后，elementwise 链占比上升，融合的相对收益放大。
+
+### 同树双后端对照（fused 树，5090 新现象）
+
+| 负载 | 0.6B paged | 0.6B flash | 1.7B paged | 1.7B flash |
+|---|---|---|---|---|
+| w1 decode | **2.76 ms/tok** | 4.17 | **3.30** | 4.33 |
+| w2 prefill e2e | 0.64s | **0.58s** | 0.86s | **0.63s** |
+| w3 batch32 | **9049 tok/s** | 6285 | **5859** | 6006（≈持平） |
+| w4 decode | **2.77 ms/tok** | 4.24 | **3.57** | 4.38 |
+
+**FA2 在 5090 上 decode 慢 35%~50%**（mha_fwd_kvcache 的 sm80 时代
+kernel 在 Blackwell 上效率不佳；v4 在 5060 Ti 上两者基本持平），只赢
+prefill（1.7B w2 -27%）。含义："flash-attn 设为默认后端"在本平台
+不成立；合理方向是 **prefill 走 FA、decode 走自研 splitkv 的分离路由**
+（vLLM 即此类设计）。5060 Ti 上该结论需复核（v4 数据是融合前的）。
+
+### 正确性（--dump-outputs + compare_outputs.py）
+
+- FA 栈同 binary 噪声底 = 0（A1 vs A2 四负载全 exact）。
+- fused vs unfused（FA 栈）：0.6B w2/w4 全 exact，w1 @8、w3 28/32；
+  1.7B w2 exact，w1 @40、w3 28/32、w4 @190。
+- 关键对照：同树换后端（paged↔flash，代码不变）的噪声底分叉位置
+  **与 fused-vs-unfused 重合**（0.6B w1@8、1.7B w1@40、w4@160~190）——
+  融合引入的数值扰动与换一个 attention 实现同量级，非功能错误。
+
+数据归档：`results/*_rtx5090_fa_{fused,unfused}.json`（FA ABBA 八轮中的
+四+1.7B 两轮）与 `*_rtx5090_paged_fused.json`（同树 paged 参考）。
+
+### 待办更新
+
+- [ ] InfiniLM-vs-vLLM 健康平台全栈对照（5090：vLLM 独立 venv 待建）——
+      立项决策表的最后一块。
+- [ ] prefill=FA / decode=splitkv 分离路由的引擎支持评估（v8 新方向）。
+- [ ] （可选）5060 Ti 上复核 FA decode 回退现象。
+
+---
+
+## v7（2026-08-27）：elementwise 链闭环 —— nsys kernel 级证据
+
+动机：v3 的 nsys 归因（"rmsnorm+rope+swiglu 未融合，~157ms/prefill，
+~590 次小 kernel"）留下的第二优化项，在 v5 融合 rms_norm_rope 后还剩
+多少？v6 期间代码走读发现 **swiglu 与 add_rms_norm 其实早已融合**：
+
+- `Qwen3MLP = layers::MLP`（`qwen3_for_causal_lm.hpp:7`）→
+  `csrc/layers/mlp/mlp.cpp:34` 调 `infinicore::op::swiglu`（InfiniCore
+  的 NVIDIA 融合 kernel，2025-07 起就在上游 main）——v3 旧树同样如此；
+- paged 路径 `TextDecoderLayer::forward(positions, hidden, residual)`
+  走 `RMSNorm::forward_inplace(x, residual)` → NVIDIA 上
+  `op::add_rms_norm_inplace`（`InfiniCore src/infinicore/nn/rmsnorm.cc:37`）。
+
+即 v3 口径里的"swiglu 未融合"不成立（当时已是单 kernel），剩余项只有
+q/k norm+rope（v5 已融合）。本轮在 5090 上用 nsys 对 w2
+（3240 tok prefill + 128 decode，含一轮 warmup，即两次前向）做
+kernel 级 A/B 实证：
+
+| 成分 | 未融合（n / GPU 时间） | 融合（n / GPU 时间） |
+|---|---|---|
+| q/k norm+rope | rmsnormKernel 14592 / 39.4ms + ropeThreadPerItem 14336 / 28.4ms | **rmsNormRopeKernel 14336 / 21.3ms** |
+| 残差+norm（两侧均融合） | add_rmsnormKernel 14336 / 31.5ms | 14336 / 31.1ms |
+| MLP swiglu（两侧均融合） | SwiGLUCuda 7168 / 10.5ms | 7168 / 10.4ms |
+| **全 trace kernel 总数** | **101,834** | **87,498（-14%）** |
+
+（两侧 trace 均含 warmup+计时两次 w2；每次前向的 q/k norm+rope 从
+28 层 × 4 launch 降到 ×2。）
+
+对账：q/k norm+rope GPU 时间 67.8ms→21.3ms（两次前向合计省 ~46ms，
+单次 ~23ms），叠加 launch 延迟节省，与 v6 的 w2 e2e -4.5%（0.67→
+0.64s，省 ~30ms）量级吻合。
+
+结论与待办更新：
+
+1. **v3 的 elementwise 链项至此闭环**：paged 路径三项（残差+norm、
+   q/k norm+rope、swiglu）全部单 kernel 化。"swiglu 融合"待办销项——
+   无需新算子，上游既有实现。
+2. trace 中剩余的大头：decode 段 paged-attn splitkv（286.7ms/两次）与
+   gemm（259ms，28,704 次小 gemm —— decode 每 token 每层 5 个投影
+   gemm，微 batched 化是潜在方向但收益待估）；prefill 段自研
+   PagedAttentionPrefill 在 0.6B 上 53ms/次（3240 tok），v4 已证 FA2
+   可再压一个量级——5090 上落 FA 是下一个候选动作。
+3. 分析脚本：profile 采集与聚合命令见 v6 复现要点 + 本轮
+   `nsys profile -t cuda` + 自研聚合脚本（分类统计 kernel 名）。
+
+---
+
+## v6（2026-08-27）：5090 复测 —— rms_norm_rope 收益确认，量级 -4%~-8%
+
+动机：v5 在 8GB WSL2 病态平台（显存驻留超 ~3~4GB 后带宽崩塌至
+1~11 GB/s）测得 -4%~-23%，需在健康平台复测量级。本轮在租用
+RTX 5090 32GB（Gitee AI 容器，CUDA 12.8 / driver 610.43.02 /
+384 核 x86_64）完成。
+
+**backend 差异注意**：本轮为 **paged-attn**（5090 上尚未构建 FA 版
+InfiniCore；v5 主数据为 flash-attn）。融合点在 attention 之前的 q/k
+norm+rope，与 attention 后端无关，但绝对数字不可与 v5 直接比较。
+配置：64 blocks、no-graph、贪心解码、逐字节同 prompt（同 v5）。
+
+### 0.6B 交错 ABBA（paged-attn，e2e 秒）
+
+| 负载 | A1 未融合 | A2 未融合 | B1 融合 | B2 融合 | e2e Δ |
+|---|---|---|---|---|---|
+| w1 单请求 decode | 0.36 | 0.39 | 0.36 | 0.36 | -4.0%（A 侧自身波动同量级，边际） |
+| w2 长 prefill + 128 decode | 0.67 | 0.67 | 0.64 | 0.64 | **-4.5%** |
+| w3 batch32 | 0.49 | 0.48 | 0.45 | 0.45 | **-7.2%** |
+| w4 长 decode | 3.14 | 3.08 | 2.87 | 2.85 | **-8.0%** |
+
+本机无"越跑越慢"漂移（A1≈A2；ABBA 仅作保险）。方向与 v5 一致，
+量级收窄——launch 开销在强 CPU + 健康显存平台上占比下降。
+
+### 1.7B 单跑对照（paged-attn，各一轮，量级仅作参考）
+
+| 负载 | 未融合 | 融合 | Δ |
+|---|---|---|---|
+| w1 单请求 decode | 3.32 ms/tok | 3.28 ms/tok | -1.2% |
+| w2 长 prefill + 128 decode | 0.90s | 0.86s | -4.4% |
+| w3 batch32 | 5795 tok/s | 5637 tok/s | -2.7%（疑噪声，未复跑） |
+| w4 长 decode | 3.66 ms/tok | 3.60 ms/tok | -1.7% |
+
+### 正确性（--dump-outputs + compare_outputs.py）
+
+- **噪声底 = 0**：同 binary 跨轮（A1 vs A2）四负载全 exact——本机上
+  unfused 完全确定，因此下述分叉全部可归因于融合 kernel 的 fp32 归约
+  顺序差异（算子级 ≤3ulp 已在 v5 证明）。
+- 0.6B fused vs unfused：w2、w4 全 exact；w1 @8 分叉；w3 29/32
+  exact。分叉处两侧文本均连贯（如 w3 req9："描述一个没有重力的世界"
+  vs "描述一个有重力的世界"），属 bf16 logit 并列翻牌。
+- 1.7B fused vs unfused：w1、w2 全 exact；w3 23/32（含一处 @0 首
+  token 翻牌）；w4 @160 分叉（"从人类学角度分析" vs "从科技角度分析"，
+  两侧连贯）。分叉形态与 v5（8GB 机）一致。
+
+### 结论
+
+1. rms_norm_rope 融合在健康平台确认有效：0.6B ABBA e2e **-4%~-8%**
+   （prefill/批处理越重收益越大），1.7B -1%~-4%（单跑）。v5 的 -23%
+   量级含 8GB 机病态放大；收益随平台算力/CPU 性能上升而收窄，数据中心
+   卡上预期也是这个量级。
+2. 正确性证据链闭环：算子级 ≤3ulp（v5）+ 双模型 e2e 并列翻牌形态
+   双平台一致（v5/v6）。
+3. 数据归档：`results/*_rtx5090_{fused,unfused}.json`（0.6B ABBA 四轮
+   + 1.7B 各一轮，均含 dump-outputs）。
+
+### 5090 租用机复现要点（Gitee AI 容器）
+
+- SSH 经堡垒机：`dev_perf/vm_ssh.py` / `vm_scp.py`（pexpect 状态机，
+  密码从 `VM_PASSWORD` 环境变量读取，可入库）。
+- GitHub 不可达：xmake 从 gitee 源码构建（`gitee.com/tboox/xmake`，
+  子模块为相对 URL，clone 时自动落在 gitee）；xmake-repo 预置
+  `gitee.com/tboox/xmake-repo` 到 `~/.xmake/repositories`（apt 的
+  xmake 2.8.7 与现版仓库不兼容：on_source nil）。git 在 pty 下会开
+  pager 卡住自动化，需 `git --no-pager`。
+- pip 用 `-i https://mirrors.aliyun.com/pypi/simple/`（pypi.org DNS
+  只回 IPv6）；HF 下载需 `HF_HUB_DISABLE_XET=1`（hf-mirror 的 xet
+  通道 401）。
+- 容器仅 /root、/data 持久化；macOS 侧打包后需
+  `find -name '._*' -delete`（bsdtar 的 AppleDouble 文件会混进编译）。
+- InfiniCore 构建：`--cudnn=y`（cudnn=n 在本 HEAD 上 avg_pool3d 编译
+  不过）；删除空的 third_party/cutlass 目录（否则 ENABLE_CUTLASS_API
+  打开后 scaled_mm 找不到 cute 头）；`xmake build` 后需显式 build+install
+  `infiniccl`、`infinicore_cpp_api`、`_infinicore`（非默认 target）。
+- unfused 快照（2366377）的 bench.py 有 /home/yyy 硬编码路径，VM 上
+  sed 成自身 checkout 路径（v5 已去硬编码，仅影响旧快照）。
 
 ---
 
@@ -250,9 +458,11 @@ elementwise 链未融合。这是边界清晰、可度量的 kernel 优化目标
       差距收敛到 ~1.05~1.3×，正确性逐 token 对拍通过。
 - [x] ~~（可选）elementwise 融合（rmsnorm/rope）作为第二优化项~~ ——
       已由 v5 完成：`rms_norm_rope` 算子接入 Qwen3 paged 路径，0.6B
-      ABBA e2e -4%~-23%，三层正确性证据齐备；16GB 机复测待做。
-- [ ] （可选）swiglu 融合——v5 后 elementwise 链剩余的一半（v3 口径
-      rmsnorm+rope+swiglu 合计 ~157ms/prefill）。
+      ABBA e2e -4%~-23%，三层正确性证据齐备；跨平台复测已由 v6 完成
+      （5090 上 0.6B ABBA -4%~-8%，正确性形态一致）。
+- [x] ~~（可选）swiglu 融合~~ —— 销项：上游 swiglu/add_rms_norm 早已
+      融合，Qwen3 paged 路径一直在用；v7 nsys 实证 elementwise 链已
+      全部单 kernel 化。
 - [ ] （可选）flash-attn 设为默认 attention backend 的评估：需在更多模型
       上补正确性对拍，并确认 FP8/滑窗/softcap 模型的回退路径。
 - [ ] Qwen3-8B-FP8 下载完成后，可作为 8B 级 + FP8 口径的复测对象。

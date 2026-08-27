@@ -55,5 +55,7 @@ InfiniLM 侧常用参数：
 
 差距清单（哪个负载、差多少、可能原因）→ 据此决定 #2 是否转正立项，以及立项的可度量目标。
 
-最新进展见 `dev_perf/gap_analysis.md`（v4：flash-attn 接入落地，prefill
-差距收敛到 ~1.05~1.3×；含对比表、归因、复现命令和立项书模板）。
+最新进展见 `dev_perf/gap_analysis.md`（v8：5090 全栈合流——FA2+融合
+ABBA -5%~-13%，并发现 FA decode 在 Blackwell 上慢于自研 splitkv，默认
+后端结论修正；v7 elementwise 链 kernel 级闭环；含对比表、归因、复现
+命令和立项书模板）。
