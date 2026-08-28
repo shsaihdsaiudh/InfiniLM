@@ -4,7 +4,9 @@
 #include "marlin_support.hpp"
 #include "marlin_utils.hpp"
 
+#include <infinicore/ops/add.hpp>
 #include <infinicore/ops/fp8_blockwise_dequantize.hpp>
+#include <infinicore/ops/fp8_blockwise_gemm.hpp>
 #include <infinicore/ops/linear.hpp>
 
 #include <cstring>
@@ -77,16 +79,48 @@ infinicore::Tensor FP8Blockwise::forward(
     float alpha) const {
     auto input_contiguous = input->is_contiguous() ? input : input->contiguous();
 
-    // Naive path (correctness first): dequantize the block-scaled FP8 weight
+    // Fused path (decode): the fp8_blockwise_gemm kernel reads every FP8
+    // weight byte exactly once and dequantizes in registers, avoiding the
+    // materialized BF16 weight of the naive path. Measured on RTX 5090
+    // (Qwen3-8B-FP8): the fused kernel wins for M <= 8 (bs=1: 141 vs 28
+    // tok/s; bs=8: 412 vs 218) and loses from M >= 16 (bs=16: 382 vs 427),
+    // where the cuBLAS-backed naive path keeps the traffic advantage of one
+    // dequantized weight read per 16 rows. Large-M (prefill) also stays on
+    // the naive path, and the fused kernel currently implements alpha == 1
+    // only. Set INFINILM_FP8_FUSED_GEMM=0 to force the naive path (A/B
+    // testing).
+    static const bool fused_gemm_enabled = [] {
+        const char *env = std::getenv("INFINILM_FP8_FUSED_GEMM");
+        return env == nullptr || env[0] != '0';
+    }();
+    const auto &weight = params.at("weight");
+    const size_t k = weight->size(1);
+    const size_t m = input_contiguous->numel() / k;
+    if (fused_gemm_enabled && alpha == 1.0f && m <= 8
+        && input->device().getType() == infinicore::Device::Type::NVIDIA
+        && block_m_ % 16 == 0 && block_n_ % 128 == 0 && k % 128 == 0) {
+        auto flat_input = input_contiguous->view({m, k});
+        auto output = infinicore::op::fp8_blockwise_gemm(
+            flat_input, weight, params.at("weight_scale_inv"));
+        if (has_bias) {
+            auto bias = params.at("bias");
+            infinicore::op::add_(output, output, bias->as_strided(output->shape(), {0, 1}));
+        }
+        auto out_shape = input_contiguous->shape();
+        out_shape.back() = output->size(1);
+        return output->view(out_shape);
+    }
+
+    // Naive path (prefill / fallback): dequantize the block-scaled FP8 weight
     // to the activation dtype, then run the standard GEMM.
-    auto weight = infinicore::op::fp8_blockwise_dequantize(
-        params.at("weight"), params.at("weight_scale_inv"), input->dtype());
+    auto dequant_weight = infinicore::op::fp8_blockwise_dequantize(
+        weight, params.at("weight_scale_inv"), input->dtype());
 
     std::optional<infinicore::Tensor> bias_opt;
     if (has_bias) {
         bias_opt = params.at("bias");
     }
-    return infinicore::op::linear(input_contiguous, weight, bias_opt, alpha);
+    return infinicore::op::linear(input_contiguous, dequant_weight, bias_opt, alpha);
 }
 
 std::vector<SplitParam> FP8Blockwise::split_params(
