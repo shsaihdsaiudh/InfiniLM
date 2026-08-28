@@ -1,7 +1,7 @@
 # FP8 块量化权重执行路径 — 立项草案
 
 > 项目方向:训练营项目 #4(量化与低精度推理)
-> 状态:W1–W3 已完成(W3 于 5090 复测:wikitext2 PPL 偏差 0.082% 达标;decode 31% BF16 未达标,差距已量化 → W4 融合 GEMM 依据,详见 dev_fp8/w3_eval_report.md);W4 性能迭代为后续工作
+> 状态:W1–W3 已完成(W3 于 5090 复测:wikitext2 PPL 偏差 0.082% 达标;decode 31% BF16 未达标,差距已量化 → W4 融合 GEMM 依据,详见 dev_fp8/w3_eval_report.md);W4 进行中:marlin 路线代码已完成(INFINILM_FP8_MARLIN=1 可选开启)但 InfiniCore marlin kernel 在 sm_120 上不可用(已定位并记录 dev_fp8/marlin_sm120_issue.md,含最小复现),性能迭代转自研融合 kernel 或待上游修复
 > 分支:feat/fp8-blockwise-quantization(配套 InfiniCore 分支 feat/fp8-blockwise-dequantize;worktree: ../InfiniLM-fp8)
 > 日期:2026-08-23
 
