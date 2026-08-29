@@ -1,11 +1,235 @@
 # 项目 #2 基线差距清单
 
-最新结论见 v9（2026-08-27）：v8 提出的「prefill/decode 分离路由」已落地
-为 `hybrid` 后端（prefill→FA2 varlen，decode→自研 paged kernel 经 strides
-直读 FA 的 BSHD cache，零数据搬运）。5090 上 0.6B 全负载合并收益
--8%~-37%（对 flash-attn）且与 paged-attn 持平或更优；1.7B decode
--18%~-22%。新发现：长 ctx（~3.3k）下 paged decode kernel 不再赢 FA，
-交叉点在 1k~3.3k 之间，ctx 自适应路由列为后续项。
+最新结论见 v11（2026-08-29）：图外开销优化（打包 H2D + 采样伴随图）
+落地并验证——全矩阵输出与上一版逐 token 全 exact，但 e2e 收益在
+5090 热噪声内（采样 launch 本就被 forward 图的异步执行隐藏，gap≈0）。
+瓶颈回到 forward 图本身（bs32 ~1.6~2.1ms/step GPU 时间），下一步应
+转向图内 kernel / 调度重叠。v10 的全栈对照结论（vLLM 0.28 全面领先
+hybrid 基线：w3 +64%~+80%、w2 -50%）不变。
+
+---
+
+## v11（2026-08-29）：图外开销优化落地 —— 打包 H2D + 采样伴随图
+
+动机：v10 归因指出 graph 模式每步仍有图外开销——6 个小输入各一次
+H2D copy、采样段 32 请求 × 3 launches（cub ArgMax×2 + cast）。本轮把
+这两处削掉并实测收益。
+
+### 改动（本地未提交，csrc/engine/{compiler/*,rank_worker.cpp}）
+
+1. **打包 H2D**：`make_decode_input` 把 input_ids / position_ids /
+   slot_mapping 打进一条连续 int64 缓冲（pack_i64），total_seq_lens /
+   input_offsets / cu_seqlens 打进一条连续 int32 缓冲（pack_i32），
+   图输入做成两条缓冲的视图；`get_compiled` 快速路径两次 memcpyH2D
+   代替原 5+1 次 copy_from；block table 在 block_per_req==编译宽度时
+   跳过 -1 填充。
+2. **采样伴随图**：`compile()` 对 b≤64 的每个 decode 图录一个
+   companion graph（逐请求 argmax：cub DeviceReduce ArgMax + 索引
+   cast），greedy（top_k==1 或 temperature==0）且 decode 图命中时
+   replay 它，代替每步 32×3 次 launch。kill switch：
+   `INFINILM_DISABLE_SAMPLING_GRAPH=1`；调试：
+   `INFINILM_DEBUG_SAMPLING=1`（命中时打印一次）。
+
+### 关键坑（排查记录，后续接图的人必读）
+
+infinicore 的 `Graph` **不是裸 CUDA stream capture，是算子序列录制**：
+只有经 `INFINICORE_GRAPH_OP_REGISTER_*` 注册的算子类才会在录制时进入
+`op_list_`（录制模式下算子只登记不执行；`instantiate()` 先跑 5 遍
+warmup 再按 capture 安全性切段捕获）。`random_sample` 是纯 dispatcher
+注册（`random_sample_infiniop.cc` 无 graph 钩子），greedy 路径又被
+`tryGreedyWithInfiniOps`（infiniops Argmax）在 dispatcher 之前拦截——
+直接 `startGraphRecording() + random_sample_` 录到的是 **operators=0
+的空图**，replay 等于空操作，读到的是编译期陈旧 logits 的 argmax 结果
+（编译用全零退化输入，total_seq_lens=0 → logits 为 NaN 垃圾 → 越界
+token id，`tokenizer.decode` 抛 OverflowError）。修复：自定义
+`SamplingLoopOperator`（`GraphOperator` 子类）包装整个采样循环，
+`context::addGraphOperator` 手动入列，由 `instantiate()` 统一 warmup+
+捕获。第二坑：包装 lambda 必须**按值捕获**张量（操作符比 compile()
+作用域活得久，且持锁张量内存）。
+
+### 正确性
+
+hybrid+graph 全矩阵 `--dump-outputs`（`..._0829_145012.json`）与修复前
+已验证版本（`5090_graphopt/..._0829_141752.json`）**w1/w2/w3/w4 逐
+token 全 exact**（32/32 请求全对）。采样图与 eager argmax 语义一致。
+
+1.7B 复验（w3_batch32，同构建采样图 ON vs kill switch）：31/32 exact
+@token90；同配置两个进程互跑（采样图 ON vs ON）也是 30/32 @token90
+——偏差来自 forward 自身的运行间抖动（v10 记录的 1.7B bs32 批噪声底
+同类），与采样路径无关。1.7B w3 吞吐 6214~6269 tok/s，与 v10 graph
+基线（6211）持平。
+
+### 性能（同构建 ABBA，kill switch 交替，0.6B w3_batch32）
+
+| 轮次 | A=采样图 ON | B=eager 采样 |
+|---|---|---|
+| 1 | 11214 | 9530 |
+| 2 | 9547 | 9499 |
+| 3 | 9526 | 10275 |
+
+中位数 9547 vs 9530 tok/s —— **差 ~0.2%，在 5090 热双态噪声内**。
+STEP_PROF 分段（A vs B，step 64/128 均值）：forward 段 1.67 vs 1.68ms
+（稳定省 ~10µs/step），sched/post/gap 不变。
+
+### 结论
+
+1. **图外开销在 graph 模式本就被异步隐藏**：采样 launch 在 forward 图
+   仍在 GPU 执行时就已发出（gap≈0），削掉它 e2e 不动。本轮改动保留
+   （每步省 ~10µs CPU + 消除采样段分配搅动，对更大 batch 或 CPU-bound
+   场景仍有意义；正确性已验证，且有 kill switch）。
+2. **瓶颈回到 forward 图本身**：bs32 每步 ~1.6~2.1ms 是图内 GPU 时间。
+   下一步方向：图内 kernel 归因（GEMM / hybrid attention / mamba 段在
+   bs=32 的占比）、以及与 vLLM 的调度层差距（continuous batching 的
+   step 内重叠），图外已无可削。
+
+---
+
+## v10（2026-08-29）：5090 全栈对照 —— InfiniLM(hybrid) vs vLLM 0.28
+
+动机：v8/v9 遗留的「立项决策最后一块」——此前全部 vLLM 数据出自
+5060 Ti（WSL2）与 8GB 病态机，vLLM 从未在健康平台跑过。本轮在 5090
+建起 vLLM 独立 venv 并跑全负载矩阵，InfiniLM 侧用 v9 的 hybrid 基线。
+
+环境：
+
+- **vLLM 0.28.0 + torch 2.13.0+cu130**（`/root/.venv-vllm`，uv 0.9.9
+  经阿里云镜像安装）：v1 默认（CUDA graph on、prefix caching on、
+  chunked prefill on），gpu_memory_utilization=0.85，attention 自动选
+  **FLASH_ATTN**（vllm 内置 FA2，sm_120 候选序列首位）。两个坑见文末
+  「5090 装 vLLM 工程记录」。
+- **InfiniLM hybrid**：64blk、no-graph（沿用 v1~v9 对比惯例），另加测
+  一组 `--enable-graph`（hybrid×graph 首次实测，顺带验证兼容性）。
+- 同树同机同日：hybrid ×2 轮、hybrid+graph ×1 轮、vLLM ×2 轮，全部
+  `--dump-outputs`；hybrid 同日两轮与 v9（0827）数值互验一致。
+
+### 性能（两轮均值；vLLM Δ 列为对 hybrid / 对 hybrid+graph）
+
+**0.6B**（hybrid 峰值 4.1GB，vLLM 28GB@0.85 档）：
+
+| 负载 | hybrid | hybrid+graph | vLLM | Δ vs hybrid | Δ vs hy+graph |
+|---|---|---|---|---|---|
+| w1 单请求 decode | 2.92 ms/tok | 1.76 | **1.63** | **-44%** | -7% |
+| w2 长 prefill + 128 decode | 0.53 s | 0.53 | **0.26 s** | **-50%** | **-50%** |
+| w3 batch32 | 8621 tok/s | 9479 | **15510** | **+80%** | **+64%** |
+| w4 长 decode | 2.93 ms/tok | 2.03 | **1.60** | **-45%** | **-21%** |
+
+**1.7B**（hybrid 峰值 7.2GB，vLLM 27.6~28.2GB）：
+
+| 负载 | hybrid | hybrid+graph | vLLM | Δ vs hybrid | Δ vs hy+graph |
+|---|---|---|---|---|---|
+| w1 | 3.30 ms/tok | 3.20 | **3.10** | **-6%** | -3% |
+| w2 | 0.75 s | 0.74 | **0.48 s** | **-36%** | -35% |
+| w3 | 6162 tok/s | 6211 | **8767** | **+42%** | +41% |
+| w4 | 3.45 ms/tok | 3.50 | **3.06** | **-11%** | -12% |
+
+（加载耗时参考：hybrid ~6s；vLLM 冷启 46s / 编译缓存命中后 18~22s。）
+
+### 结论
+
+1. **健康平台上 vLLM 全面领先**，5060 Ti 的「decode 持平、仅 prefill
+   差 1.3~1.5×」结论不能外推。差距结构：
+   - **w3（batch32 吞吐）差距最大**（+42%~+80%），其次 **w2**
+     （-36%~-50%）——指向批处理调度、chunked prefill 与全图捕获的
+     decode 段，而非单个 kernel；
+   - 单请求 decode（w1/w4）1.7B 仅差 6%~11%（hybrid 无 graph 对
+     vLLM 有 graph），0.6B 差 44%~45%（小模型 launch-bound 占比高）。
+2. **graph 不是差距主因**：hybrid+graph 在 0.6B decode 上 -31%~-40%
+   （0.6B launch 开销占比确实大），但补不回 w3/w2 的差距（仍落后
+   41%~64%）；1.7B 上 graph 收益在噪声内（±3%）。hybrid×graph 首次
+   实测无回退，输出与 no-graph 对照 0.6B 四负载全 exact、1.7B 仅
+   w3 30/32（@93，既有批噪声底同类），作为默认配置可行。
+3. **v9 的内部结论不受影响**：hybrid 仍是 InfiniLM 三后端中最优单配置；
+   但对 vLLM 的立项差距在健康平台上重新打开，下一轮优化目标应转向
+   w3/w2 的归因（见待办）。
+
+### w3 差距归因（nsys，0.6B，同日补抓）
+
+方法：nsys 2024.6 抓 `--only w3_batch32` 全 trace，sqlite 导出后按 w3
+窗口切片聚合（脚本 VM `/root/slice_w3.py`，trace 存 `/root/prof/v10/`）。
+w3 = 32×~15tok prefill + 128 步 batch32 decode，**decode 段主导**。
+注意：nsys 对 CUDA graph replay 内的 kernel 记录不全（vLLM 侧 window
+busy 仅 9%，物理上不可能——0.6B×bs32 单权重读取就需 ~0.7ms/step），
+vLLM kernel 级数字仅作参考，wall/launch 数可信；hybrid 侧记录完整。
+
+**hybrid no-graph**（w3 窗口 570ms）：
+
+- **每 decode step ~435 次 kernel launch**：gemm 4 次/层（qkv/o/gate_up/
+  down 已是融合 gemm）+ 2 次 cublas splitk 伴随 + add_rms_norm 2 +
+  rms_norm_rope 2 + swiglu 1 + cache 1 + attn 2 + ~4 次小 elementwise；
+- **GPU busy 仅 306ms（54%）**；未 profile 口径 wall 3.7ms/step vs busy
+  ~2.4ms/step → **~35% 的 wall 是 launch 空泡**；
+- kernel 时间大头是 gemm（窗口内 248ms）：bs=32 的 gemm 平均 13.7µs，
+  已在 latency floor，kernel 本身无多少油水。
+
+**hybrid+graph**（e2e 0.43s，仅 +10%）：
+
+- `PagedCompiler` 对 bs=1..64 逐档捕获 decode-only 图，bs=32 在列——
+  w3 decode 确实走了 graph replay，launch 空泡大头已消除；
+- 但每步图外仍有残余开销：5×D2D 输入拷贝 + 每次 replay 前的 reset
+  memset（`paged_compiler.cpp:165` 注释自承「still pays a memset before
+  every graph replay」）+ 采样 kernel + Python 调度，合计 ~0.7ms/step；
+- 图内 GPU 时间 ~2.4ms/step 不变 → wall 3.1ms/step，**从 launch-bound
+  转为 kernel-time-bound**。
+
+**vLLM**（e2e 0.26s，2.0ms/step）：整步单次 graph replay + inductor
+combo/fused kernel（triton 融合 norm/silu、combo gemm），图外仅少量
+采样 kernel。
+
+**归因结论**：w3 的 +80% 差距 = ①launch 空泡（hybrid 有 graph 但图外
+残余未削）+ ②图内 kernel 时间本身（bs=32 gemm 贴 latency floor，靠
+数量取胜——vLLM 融合度更高）。后续方向：a) 削图外 per-step 开销（合并
+5 次输入拷贝、去掉 per-replay memset、采样入图）；b) 评估跨 gemm 的
+进一步融合/grouped gemm。w2 的账独立于本次（v9 已定位：3.3k ctx 下
+decode 段变慢 + 无 graph），需要补 trace 时另抓。
+
+### 正确性（`compare_outputs.py`，双轮互验）
+
+- **同引擎跨轮噪声底**：hybrid 0.6B 全 exact、1.7B w3 30/32（@91，
+  与 v9 底同位置）；vLLM 自身 w3 也非确定（0.6B 27/32、1.7B 25/32，
+  批处理数值噪声）。
+- **跨引擎**：1.7B w1/w2 全 exact，w4 @190 与 v4/v5 历史分叉位置
+  完全重合；0.6B w2 exact，w1 @0 首 token 翻牌（hybrid「这个问题可能
+  引发一些人对猫的误解…」连贯，vLLM 落入重复循环——0.6B 贪心退化的
+  常见形态，双侧均为模型自身质量范围内输出），w4 @32 与 v9
+  hybrid-vs-fa 的 @32 重合；w3 22~27/32 落在双方噪声底交集内。
+- 判定：**无功能性错误**，全部为 bf16 并列翻牌 × 自回归放大。
+
+### 5090 装 vLLM 工程记录（复现要点）
+
+- **无外网**：NGC 镜像自带 `/etc/pip.conf` + `/etc/xdg/pip/pip.conf`
+  配了 pypi.org 主 index + `pypi.ngc.nvidia.com` extra-index，`-i` 只
+  覆盖主 index，包查询全卡在 ngc 的 TCP 超时——已将两个文件挪为
+  `.bak`。pip 单连接仍被限速 ~200KB/s（同文件 curl 直连 11MB/s，
+  aliyun/tuna 同速），改用 **uv**（并发下载）安装。
+- vLLM 0.28 运行需 `CUDA_HOME=/usr/local/cuda-12.8` + venv 内 ninja
+  （README 已有此条）。
+- **flashinfer 采样器 JIT 在 sm_120 上要求 nvcc≥12.9**（编译
+  `compute_120f`），VM 工具包为 12.8 → 引擎 warmup 直接报
+  「FlashInfer requires GPUs with sm75 or higher」（TARGET_CUDA_ARCHS
+  为空后的误导性报错）。对策：`VLLM_USE_FLASHINFER_SAMPLER=0` 走
+  原生采样器；贪心解码（temperature=0/top_k=1）不受影响。attention
+  不受影响——Qwen3 在 sm_120 默认 FLASH_ATTN。
+- 堡垒机 scp 逐文件重新鉴权，批量拉取需在 VM 侧先打 tar 包。
+
+### 待办更新
+
+- [x] ~~w3/w2 对 vLLM 差距的 nsys 归因~~ —— w3 已由 v10 补抓完成：
+      launch 空泡（图外残余 per-step 开销 ~0.7ms/step）+ 图内 kernel
+      时间（bs=32 gemm 贴 latency floor）。派生优化项：削图外开销
+      （合并输入拷贝/去 per-replay memset/采样入图）与 gemm 融合度。
+      w2 归因沿用 v9 结论（长 ctx decode + 无 graph），需要时补 trace。
+- [ ] hybrid+graph 设为默认的评估（0.6B decode -31%~-40%、四负载无
+      回退；需补更多模型的正确性对拍）。
+- [ ] decode 按 ctx 长度自适应路由（沿用 v9，w2@1.7B 对 FA 的内部
+      倒退仍在）。
+- [ ] （可选）5060 Ti 复核 hybrid；hybrid 推广到其他模型族（沿用 v9）。
+- [ ] （可选）flashinfer 采样器恢复：pip 侧装 `nvidia-cuda-nvcc-cu13`
+      或升级工具包至 ≥12.9；当前 FLASH_ATTN + 原生采样器已够用。
+
+数据归档：`results/5090_vllm/`（10 份：hybrid×2、hybrid+graph×1、
+vLLM×2，双模型）；v9 的 15 份同步拉回 `results/5090_hybrid/`。VM 侧
+venv `/root/.venv-vllm`，运行环境变量：
+`HF_HUB_OFFLINE=1 CUDA_HOME=/usr/local/cuda-12.8 VLLM_USE_FLASHINFER_SAMPLER=0`。
 
 ---
 
@@ -110,8 +334,9 @@ strides 安全性（hybrid 成立的命门，InfiniCore 侧核实）：
 
 - [ ] decode 按 ctx 长度自适应路由（w2@1.7B 倒退项的根治；需先 nsys
       定交叉点）。
-- [ ] InfiniLM-vs-vLLM 健康平台全栈对照（沿用 v8 待办，hybrid 为
-      InfiniLM 侧新基线）。
+- [x] ~~InfiniLM-vs-vLLM 健康平台全栈对照~~ —— 已由 v10 完成：5090 上
+      vLLM 0.28 全面领先 hybrid（0.6B decode -44%、w3 +80%；1.7B
+      decode -6%~-11%、w3 +42%），新归因待办见 v10。
 - [ ] （可选）5060 Ti 上复核 hybrid（v4 平台上 FA decode 无回退，
       hybrid 预期与 paged 持平）。
 - [ ] hybrid 推广到其他模型族（当前仅 Qwen3 paged 路径带融合；
