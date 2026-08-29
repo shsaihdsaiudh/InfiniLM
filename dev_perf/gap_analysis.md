@@ -1,11 +1,104 @@
 # 项目 #2 基线差距清单
 
-最新结论见 v11（2026-08-29）：图外开销优化（打包 H2D + 采样伴随图）
-落地并验证——全矩阵输出与上一版逐 token 全 exact，但 e2e 收益在
-5090 热噪声内（采样 launch 本就被 forward 图的异步执行隐藏，gap≈0）。
-瓶颈回到 forward 图本身（bs32 ~1.6~2.1ms/step GPU 时间），下一步应
-转向图内 kernel / 调度重叠。v10 的全栈对照结论（vLLM 0.28 全面领先
-hybrid 基线：w3 +64%~+80%、w2 -50%）不变。
+最新结论见 v12（2026-08-29）：decode 按 ctx 长度自适应路由落地——
+hybrid 长 ctx decode 自动切 FA kvcache（与 splitkv 读同一块 BSHD
+cache，零数据转换），阈值按模型几何查表（5090 实测交叉点
+0.6B≈3.4k / 1.7B≈1.5k），未测几何默认不路由。1.7B w2 倒退根治：
+0.74→0.55s（-26%），路由后输出与 flash-attn 后端逐 token 全 exact；
+0.6B 四负载零回退（逐 token 全 exact）。v11 图外开销（打包 H2D +
+采样伴随图）正确性全 exact、e2e 收益在热噪声内。v10 全栈对照结论
+（vLLM 0.28 全面领先）不变；下一步主战场：bs×ctx 第三象限网格扫描
+与长 ctx 多并发对 vLLM 对照。
+
+---
+
+## v12（2026-08-29）：decode 按 ctx 长度自适应路由 —— w2@1.7B 倒退根治
+
+动机：v9 遗留「hybrid 在长 ctx decode 输给 FA kvcache」（w2@1.7B 0.75
+vs 0.62，交叉点 1k~3.3k 未定）。本轮先做 ctx 扫描把交叉点定死，再落
+路由。
+
+### ctx 扫描（新增 `bench.py --ctx-sweep`，单请求 decode 128 tok，eager）
+
+`_BASE_PARA×k` ≈ 81k token 提示词，两后端 prefill 同为 FA2，e2e 差即
+decode kernel 差。ms/tok（越低越好）：
+
+| ctx | 0.6B hybrid | 0.6B FA | 1.7B hybrid | 1.7B FA |
+|---|---|---|---|---|
+| 162 | **2.79** | 4.25 | **3.39** | 4.24 |
+| 1296 | **2.80** | 4.24 | **4.25** | 4.33 |
+| 1944 | **3.13** | 4.35 | 4.70 | **4.38** |
+| 2592 | **3.51** | 4.32 | 5.11 | **4.45** |
+| 3240 | **3.94** | 4.28 | 5.57 | **4.55** |
+| 3888 | 4.36 | **4.29** | 5.96 | **4.58** |
+| 5184 | 5.26 | **4.42** | 6.92 | **4.73** |
+
+两个结构性发现：
+
+1. **FA kvcache 随 ctx 几乎平坦**（1.7B 斜率 ~0.1µs/tok），splitkv 线性
+   增长（0.6B ~0.49、1.7B ~0.70 µs/tok）——FA kernel 内对 KV 长度方向
+   并行得好，splitkv 在 bs=1 并行度不够。交叉点 **0.6B≈3.4k /
+   1.7B≈1.5k**，随模型几何移动，不能写死全局常数。
+2. **FA decode 的固定底线与模型大小无关**（0.6B/1.7B 同為 4.24ms）——
+   短 ctx 下 FA 路径是固定开销（eager launch/边界）主导而非带宽主导。
+   上表是 eager 数据；graph 模式吃掉固定开销后交叉点会移动，表内阈值
+   用于 graph 选图是偏保守的（1.7B w2 实测改善即在 graph 模式拿到）。
+
+### 实现（本分支工作区）
+
+- `attention_layer.{hpp,cpp}`：`decode_fa_ctx_threshold()`——env
+  `INFINILM_DECODE_CTX_THRESHOLD` 优先；否则按 (hidden, layers,
+  kv_heads) 查实测表：Qwen3-0.6B(1024/28/8)→3400、
+  Qwen3-1.7B(2048/28/8)→1500；未测几何 SIZE_MAX（**不路由=现状**）。
+  `HybridAttentionImpl::forward` decode 分支：
+  `max_sequence_length > 阈值` → `flash_->forward`（mha_kvcache_）；
+  两 kernel 读同一块 BSHD paged cache（splitkv 走 permute 视图），
+  **切换零拷贝**。
+- `infer_engine.cpp`：decode 步也填 `max_sequence_length`（host 侧 max
+  over CPU int32 tensor，无同步开销；非 CPU/I32 返回 0=不路由）。
+- `paged_compiler.{hpp,cpp}`：路由启用时每个 batch 档**录双图**——假
+  msl=1 录 splitkv 版、假 msl=阈值+1 录 FA 版（录制时算子只登记不执行，
+  假值只冻结 kernel 选择，replay 读真实 pack_i32）；`get_compiled` 按
+  host 侧 max ctx 选图（非 CPU/I32 保守走短 ctx 版）；采样伴随图每变体
+  各录一份，`get_sampling_compiled` 跟随 `last_served`。两变体共享
+  block_tables_holder_，block table 更新一处生效。
+
+### 正确性与性能（5090，hybrid+graph，--dump-outputs）
+
+- **0.6B 全矩阵对 v11 构建逐 token 全 exact**（阈值 3400，w2 峰值 ctx
+  3368 不触发路由；双图重构未改变短路径）。
+- **1.7B**：w1/w2/w4 对 v10 dump 全 exact、w3 31/32@109（既有批噪声底
+  同类）；**w2 路由后输出与 flash-attn 后端逐 token 全 exact**（graph
+  与 eager 均验证）——路由前后 kernel 归约顺序差在该 prompt 的 128
+  token 内未翻牌，且路由结果确实落在 FA kernel 上。
+- **性能**：1.7B w2 e2e **0.74→0.55s（-26%**，graph）/ 0.75→0.66s
+  （eager），优于 flash-attn 后端自身的 0.64s（eager）；w1/w3/w4 与
+  0.6B 全负载持平 v11（噪声内）。
+
+### 边界与后续
+
+- 阈值是 bs=1 eager 定的；**bs×ctx 第三象限（大 batch × 长 ctx）无数据**
+  ——bs=32 时 batch 方向自带 32 倍并行度，splitkv 短板被补，交叉点可能
+  大幅后移，agent 高并发场景「谁赢」待网格扫描（注意显存：两模型 KV
+  均 112KB/token，32GB 上 bs32×16k≈57GB 不可行，网格上限 bs32×8k 或
+  bs8×16k）。
+- 与 vLLM 的对照最大只测到 3.4k ctx；agent 主战场（10k+ 多并发）的
+  立项差距完全未知。
+- 中途切 kernel 引入与「换后端」同量级的 ulp 扰动（v9 已记录），greedy
+  可能翻接近的 top-2；对未测几何默认关闭，零回退风险。
+
+### 待办更新
+
+- [x] ~~decode 按 ctx 长度自适应路由~~ —— 本轮落地（w2@1.7B 0.74→
+      0.55s），阈值为 bs=1 eager 实测表 + env 覆盖，未测几何不路由。
+- [ ] bs×ctx 网格扫描（bs 1/8/32 × ctx 1k/4k/8k + bs8×16k，graph 模式）
+      ——回答 agent 象限 splitkv/FA 谁赢，并校准 graph 模式阈值。
+- [ ] 长 ctx 多并发对 vLLM 对照（agent 主战场的立项差距）。
+- [ ] hybrid+graph 设为默认的评估（沿用 v10）。
+- [ ] （可选）5060 Ti 复核；hybrid 推广其他模型族；flashinfer 采样器。
+
+数据归档：`results/5090_graphopt/`（0.6B `..._0829_154455`、1.7B
+`..._154513`、1.7B FA 参考 `..._154523`、eager 路由 `..._154645`）。
 
 ---
 
@@ -220,8 +313,8 @@ decode 段变慢 + 无 graph），需要补 trace 时另抓。
       w2 归因沿用 v9 结论（长 ctx decode + 无 graph），需要时补 trace。
 - [ ] hybrid+graph 设为默认的评估（0.6B decode -31%~-40%、四负载无
       回退；需补更多模型的正确性对拍）。
-- [ ] decode 按 ctx 长度自适应路由（沿用 v9，w2@1.7B 对 FA 的内部
-      倒退仍在）。
+- [x] ~~decode 按 ctx 长度自适应路由~~ —— 已由 v12 落地（w2@1.7B
+      0.74→0.55s，阈值查表 + env 覆盖，未测几何不路由）。
 - [ ] （可选）5060 Ti 复核 hybrid；hybrid 推广到其他模型族（沿用 v9）。
 - [ ] （可选）flashinfer 采样器恢复：pip 侧装 `nvidia-cuda-nvcc-cu13`
       或升级工具包至 ≥12.9；当前 FLASH_ATTN + 原生采样器已够用。
@@ -332,8 +425,8 @@ strides 安全性（hybrid 成立的命门，InfiniCore 侧核实）：
 
 ### 待办更新
 
-- [ ] decode 按 ctx 长度自适应路由（w2@1.7B 倒退项的根治；需先 nsys
-      定交叉点）。
+- [x] ~~decode 按 ctx 长度自适应路由~~ —— 已由 v12 落地（交叉点经
+      ctx 扫描实测：0.6B≈3.4k / 1.7B≈1.5k，bs=1 eager）。
 - [x] ~~InfiniLM-vs-vLLM 健康平台全栈对照~~ —— 已由 v10 完成：5090 上
       vLLM 0.28 全面领先 hybrid（0.6B decode -44%、w3 +80%；1.7B
       decode -6%~-11%、w3 +42%），新归因待办见 v10。

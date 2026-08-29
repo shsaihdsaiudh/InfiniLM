@@ -2,6 +2,7 @@
 
 #include "graph_compiler.hpp"
 
+#include <limits>
 #include <unordered_map>
 
 namespace infinilm::engine {
@@ -38,9 +39,20 @@ private:
         infinicore::Tensor sampling_out;
     };
 
-    std::unordered_map<
-        size_t, // num_requests
-        CompiledResult>
-        compiled_map_decode_;
+    // Decode-kernel ctx routing: when decode_fa_ctx_threshold() is finite,
+    // each batch size gets a second capture whose attention layers recorded
+    // the FA kvcache kernel (routed by the fake max_sequence_length used at
+    // capture time). get_compiled() picks the variant by the runtime batch's
+    // max context length, which it already has on the host.
+    struct DecodeVariants {
+        CompiledResult short_ctx;
+        CompiledResult long_ctx;
+        bool has_long = false;
+        // Set by get_compiled(); get_sampling_compiled() serves the sampling
+        // graph of the variant it most recently handed out.
+        CompiledResult *last_served = nullptr;
+    };
+    std::unordered_map<size_t, DecodeVariants> compiled_map_decode_;
+    size_t decode_ctx_threshold_ = std::numeric_limits<size_t>::max();
 };
 } // namespace infinilm::engine

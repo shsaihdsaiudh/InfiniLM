@@ -20,7 +20,7 @@ import os
 import sys
 import time
 
-from workload import WORKLOADS, MemSampler, resolve_model_path
+from workload import WORKLOADS, MemSampler, ctx_sweep_workloads, resolve_model_path
 
 # Checkout whose built infinilm package we benchmark. Defaults to this repo's
 # own python/ dir (where `xmake install _infinilm` lands its .so); override
@@ -165,6 +165,12 @@ def main():
         help="infinilm only: attention backend",
     )
     parser.add_argument(
+        "--ctx-sweep",
+        action="store_true",
+        help="replace the workload list with a decode-vs-context-length sweep "
+        "(single request, 128 decode tokens, ~0.2k~5k ctx)",
+    )
+    parser.add_argument(
         "--dump-outputs",
         action="store_true",
         help="record per-request output token ids in the JSON (for cross-engine correctness diffing)",
@@ -188,13 +194,16 @@ def main():
     mem_after_load = sampler.latest
     print(f"[bench] load took {load_seconds:.1f}s, mem={mem_after_load} MiB", flush=True)
 
-    # Warmup (untimed): runs W1 once to trigger lazy init / graph capture.
-    w1_name, w1_prompts, w1_mt = WORKLOADS[0]
+    workloads = ctx_sweep_workloads() if args.ctx_sweep else WORKLOADS
+
+    # Warmup (untimed): runs the first workload once to trigger lazy init /
+    # graph capture.
+    w1_name, w1_prompts, w1_mt = workloads[0]
     generate(w1_prompts, w1_mt)
 
     only = set(args.only.split(",")) if args.only else None
     results = []
-    for name, prompts, max_tokens in WORKLOADS:
+    for name, prompts, max_tokens in workloads:
         if only and name not in only:
             continue
         t0 = time.perf_counter()

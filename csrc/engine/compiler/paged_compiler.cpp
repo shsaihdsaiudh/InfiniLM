@@ -1,5 +1,6 @@
 #include "paged_compiler.hpp"
 #include "../../global_state/global_state.hpp"
+#include "../../layers/attention/backends/attention_layer.hpp"
 #include "../../utils.hpp"
 
 #include <infinicore/ops/random_sample.hpp>
@@ -94,7 +95,7 @@ void PagedCompiler::compile() {
             {nblocks * max_batch_size}, infinicore::DataType::I32, infinicore::context::getDevice());
         set_zeros(block_tables_holder_);
 
-        auto make_decode_input = [&](size_t b, CompiledResult *cr) {
+        auto make_decode_input = [&](size_t b, size_t fake_max_seq_len, CompiledResult *cr) {
             InfinilmModel::Input input;
             // The small per-step inputs live as views into two contiguous
             // device buffers, so get_compiled() can refresh them with two
@@ -154,6 +155,11 @@ void PagedCompiler::compile() {
                 input.block_tables,
                 input.slot_mapping,
             };
+            // Decode-kernel routing hint for the hybrid attention layer. The
+            // recorded op list freezes whichever kernel this selects, so the
+            // long-ctx capture passes a value above the routing threshold
+            // (1 = always the splitkv variant).
+            forward_context.attn_metadata.max_sequence_length = fake_max_seq_len;
             // Hybrid linear-attention layers read cache indices from the same
             // thread-local context. These tensors remain alive in CompiledResult
             // and are updated in place before every graph replay.
@@ -174,7 +180,7 @@ void PagedCompiler::compile() {
 
         {
             const size_t warmup_batch_size = std::min(max_batch_size, static_cast<size_t>(64));
-            auto input = make_decode_input(warmup_batch_size, nullptr);
+            auto input = make_decode_input(warmup_batch_size, 1, nullptr);
             model_->forward(input);
             infinicore::context::syncStream();
             // Warmup runs the eager Marlin path and may leave per-layer lock
@@ -184,68 +190,89 @@ void PagedCompiler::compile() {
             infinicore::context::syncStream();
         }
 
+        decode_ctx_threshold_ = layers::attention::backends::decode_fa_ctx_threshold();
+
         for (size_t b : decode_batch_sizes_) {
-            CompiledResult cr;
-            auto input = make_decode_input(b, &cr);
+            DecodeVariants variants;
 
-            barrier_->wait();
-            (void)model_->forward(input);
-            infinicore::context::syncStream();
-            // Capture must not start with stale Marlin locks from previous
-            // warmup/capture attempts. This reset is intentionally outside
-            // graph capture; the current implementation still pays a memset
-            // before every graph replay in get_compiled().
-            model_->reset_runtime_state();
-            infinicore::context::syncStream();
-            infinicore::context::startGraphRecording();
-            auto output = model_->forward(input);
-            auto graph = infinicore::context::stopGraphRecording();
-            barrier_->wait();
+            // fake_max_seq_len only steers the hybrid layer's decode-kernel
+            // routing while recording; the captured kernels read the real
+            // per-request lengths from pack_i32 at replay.
+            auto capture_variant = [&](size_t fake_max_seq_len, CompiledResult &cr) {
+                auto input = make_decode_input(b, fake_max_seq_len, &cr);
 
-            auto shared_output = std::shared_ptr<InfinilmModel::Output>(
-                new InfinilmModel::Output{infinicore::graph::GraphTensor(output.logits)});
+                barrier_->wait();
+                (void)model_->forward(input);
+                infinicore::context::syncStream();
+                // Capture must not start with stale Marlin locks from previous
+                // warmup/capture attempts. This reset is intentionally outside
+                // graph capture; the current implementation still pays a memset
+                // before every graph replay in get_compiled().
+                model_->reset_runtime_state();
+                infinicore::context::syncStream();
+                infinicore::context::startGraphRecording();
+                auto output = model_->forward(input);
+                auto graph = infinicore::context::stopGraphRecording();
+                barrier_->wait();
 
-            cr.input = std::move(input);
-            cr.compiled = std::make_tuple(graph, shared_output);
+                auto shared_output = std::shared_ptr<InfinilmModel::Output>(
+                    new InfinilmModel::Output{infinicore::graph::GraphTensor(output.logits)});
 
-            // Capture the greedy-sampling kernels (one cub ArgMax + index cast
-            // per request, reading the decode graph's logits blob) into a
-            // companion graph. Greedy batches replay this instead of issuing
-            // ~3 kernel launches per request per step. Best-effort: any
-            // capture failure just falls back to the eager sampling loop.
-            // Limited to small batch sizes to bound capture time at load.
-            if (b <= 64) {
+                cr.input = std::move(input);
+                cr.compiled = std::make_tuple(graph, shared_output);
+
+                // Capture the greedy-sampling kernels (one cub ArgMax + index
+                // cast per request, reading the decode graph's logits blob)
+                // into a companion graph. Greedy batches replay this instead
+                // of issuing ~3 kernel launches per request per step.
+                // Best-effort: any capture failure just falls back to the
+                // eager sampling loop. Limited to small batch sizes to bound
+                // capture time at load.
+                if (b <= 64) {
+                    try {
+                        const size_t vocab_size = output.logits->shape().back();
+                        auto logits2d = output.logits->view({b, vocab_size});
+                        auto sampling_out = infinicore::Tensor::empty({b}, infinicore::DataType::I64, infinicore::context::getDevice());
+                        // top_k == 1 / temperature == 0 both take the argmax branch
+                        // in the sampling op, so the captured kernels match greedy
+                        // semantics and never consume random_val. Captured by
+                        // value: the operator outlives this scope and keeps both
+                        // tensors alive.
+                        auto run_sampling = [logits2d, sampling_out, b, vocab_size]() {
+                            for (size_t i = 0; i < b; ++i) {
+                                auto score = logits2d->narrow({{0, i, 1}})->view({vocab_size});
+                                auto out = sampling_out->narrow({{0, i, 1}})->view({});
+                                infinicore::op::random_sample_(out, score, 0.0f, 1.0f, 1, 0.0f);
+                            }
+                        };
+                        // Recording alone does not run the op; instantiate() warms
+                        // the loop (settling descriptor/workspace allocations)
+                        // before capturing it into a device graph segment.
+                        infinicore::context::startGraphRecording();
+                        infinicore::context::addGraphOperator(std::make_shared<SamplingLoopOperator>(run_sampling));
+                        cr.sampling_graph = infinicore::context::stopGraphRecording();
+                        cr.sampling_out = sampling_out;
+                    } catch (const std::exception &e) {
+                        spdlog::warn("PagedCompiler: sampling graph capture failed for batch {}: {}", b, e.what());
+                        cr.sampling_graph = nullptr;
+                        cr.sampling_out = {};
+                    }
+                }
+            };
+
+            capture_variant(1, variants.short_ctx);
+            if (decode_ctx_threshold_ != std::numeric_limits<size_t>::max()) {
+                // Second capture with the FA kvcache decode kernel recorded.
+                // Best-effort: the short-ctx variant alone is still correct.
                 try {
-                    const size_t vocab_size = output.logits->shape().back();
-                    auto logits2d = output.logits->view({b, vocab_size});
-                    auto sampling_out = infinicore::Tensor::empty({b}, infinicore::DataType::I64, infinicore::context::getDevice());
-                    // top_k == 1 / temperature == 0 both take the argmax branch
-                    // in the sampling op, so the captured kernels match greedy
-                    // semantics and never consume random_val. Captured by
-                    // value: the operator outlives this scope and keeps both
-                    // tensors alive.
-                    auto run_sampling = [logits2d, sampling_out, b, vocab_size]() {
-                        for (size_t i = 0; i < b; ++i) {
-                            auto score = logits2d->narrow({{0, i, 1}})->view({vocab_size});
-                            auto out = sampling_out->narrow({{0, i, 1}})->view({});
-                            infinicore::op::random_sample_(out, score, 0.0f, 1.0f, 1, 0.0f);
-                        }
-                    };
-                    // Recording alone does not run the op; instantiate() warms
-                    // the loop (settling descriptor/workspace allocations)
-                    // before capturing it into a device graph segment.
-                    infinicore::context::startGraphRecording();
-                    infinicore::context::addGraphOperator(std::make_shared<SamplingLoopOperator>(run_sampling));
-                    cr.sampling_graph = infinicore::context::stopGraphRecording();
-                    cr.sampling_out = sampling_out;
+                    capture_variant(decode_ctx_threshold_ + 1, variants.long_ctx);
+                    variants.has_long = true;
                 } catch (const std::exception &e) {
-                    spdlog::warn("PagedCompiler: sampling graph capture failed for batch {}: {}", b, e.what());
-                    cr.sampling_graph = nullptr;
-                    cr.sampling_out = {};
+                    spdlog::warn("PagedCompiler: long-ctx decode graph capture failed for batch {}: {}", b, e.what());
+                    variants.has_long = false;
                 }
             }
-
-            compiled_map_decode_[b] = std::move(cr);
+            compiled_map_decode_[b] = std::move(variants);
         }
     }
 }
@@ -263,8 +290,7 @@ PagedCompiler::Compiled PagedCompiler::get_compiled(const InfinilmModel::Input &
             if (result == compiled_map_decode_.end()) {
                 return {nullptr, nullptr};
             }
-            auto &cr = result->second;
-            auto &graph_input = cr.input;
+            auto &variants = result->second;
 
             const auto &rt_input_ids = input.input_ids.value();
             const auto &rt_position_ids = input.position_ids.value();
@@ -272,6 +298,28 @@ PagedCompiler::Compiled PagedCompiler::get_compiled(const InfinilmModel::Input &
             const auto &rt_offsets = input.input_offsets.value();
             const auto &rt_cu_seqlens = input.cu_seqlens.value();
             const auto &rt_slots = input.slot_mapping.value();
+
+            // Pick the decode-kernel variant by the batch's longest context.
+            // The lengths tensor is expected on the host (graph replay
+            // requires a CPU int32 tensor below anyway); anything else
+            // conservatively routes to the short-ctx (splitkv) variant.
+            size_t max_ctx = 0;
+            if (variants.has_long
+                && rt_total_lens->device().getType() == infinicore::Device::Type::CPU
+                && rt_total_lens->dtype() == infinicore::DataType::I32
+                && rt_total_lens->is_contiguous()
+                && rt_total_lens->shape().size() == 1
+                && rt_total_lens->shape()[0] == batch_size) {
+                const auto *lens = reinterpret_cast<const int32_t *>(rt_total_lens->data());
+                for (size_t i = 0; i < batch_size; ++i) {
+                    max_ctx = std::max(max_ctx, static_cast<size_t>(lens[i]));
+                }
+            }
+            auto &cr = (variants.has_long && max_ctx > decode_ctx_threshold_)
+                         ? variants.long_ctx
+                         : variants.short_ctx;
+            variants.last_served = &cr;
+            auto &graph_input = cr.input;
 
             // Fast path: pack the six small inputs host-side and refresh the
             // graph inputs with two H2D copies.
@@ -345,7 +393,7 @@ PagedCompiler::Compiled PagedCompiler::get_compiled(const InfinilmModel::Input &
             // zero workspace/lock buffer shared by all Marlin layers.
             model_->reset_runtime_state();
 
-            auto graph = std::get<0>(result->second.compiled);
+            auto graph = std::get<0>(cr.compiled);
             if (graph != nullptr) {
                 const auto &runtime_seq_lens = input.total_sequence_lengths.value();
                 if (runtime_seq_lens->device().getType()
@@ -363,7 +411,7 @@ PagedCompiler::Compiled PagedCompiler::get_compiled(const InfinilmModel::Input &
                         runtime_seq_lens->data()),
                     batch_size);
             }
-            auto shared_output = std::shared_ptr<InfinilmModel::Output>(new InfinilmModel::Output{std::get<1>(result->second.compiled)->logits->resume_from_blob_()});
+            auto shared_output = std::shared_ptr<InfinilmModel::Output>(new InfinilmModel::Output{std::get<1>(cr.compiled)->logits->resume_from_blob_()});
 
             return std::make_tuple(graph, shared_output);
         }
@@ -380,10 +428,19 @@ PagedCompiler::get_sampling_compiled(size_t batch_size) {
         return {nullptr, {}};
     }
     auto it = compiled_map_decode_.find(batch_size);
-    if (it == compiled_map_decode_.end() || it->second.sampling_graph == nullptr) {
+    if (it == compiled_map_decode_.end()) {
         return {nullptr, {}};
     }
-    return {it->second.sampling_graph, it->second.sampling_out};
+    // Serve the sampling graph of whichever decode variant get_compiled()
+    // most recently handed out for this batch size (they read different
+    // logits blobs).
+    const CompiledResult *cr = it->second.last_served != nullptr
+                                 ? it->second.last_served
+                                 : &it->second.short_ctx;
+    if (cr->sampling_graph == nullptr) {
+        return {nullptr, {}};
+    }
+    return {cr->sampling_graph, cr->sampling_out};
 }
 
 } // namespace infinilm::engine

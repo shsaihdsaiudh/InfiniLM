@@ -42,6 +42,20 @@ WORKLOADS = [
     ("w4_long_decode", SHORT_PROMPTS[1:2], 1024),
 ]
 
+
+def ctx_sweep_workloads() -> list:
+    """Single-request decode-vs-context-length sweep for the decode-kernel
+    crossover study (v9/v11: paged splitkv wins short ctx, FA kvcache wins
+    long ctx; crossover is model-geometry dependent).
+
+    `_BASE_PARA` is ~81 tokens/repeat on the Qwen3 tokenizer (40 reps
+    tokenize to ~3240), so the multiplier list below spans ~0.2k~5k ctx.
+    The label is only approximate — the exact prompt token count is recorded
+    in the report at runtime. Prefill is identical across the two backends
+    (both use FA2), so the e2e delta at each ctx isolates the decode kernel.
+    """
+    return [(f"ctx81x{k}", [_BASE_PARA * k], 128) for k in (2, 4, 8, 12, 16, 24, 32, 40, 48, 64)]
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------

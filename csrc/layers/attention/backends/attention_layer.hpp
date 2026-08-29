@@ -16,10 +16,24 @@ class AttentionLayer;
 namespace backends {
 
 /**
+ * @brief Decode-kernel crossover: pure-decode steps whose longest context
+ * exceeds this threshold are routed to FA's kvcache kernel instead of the
+ * paged splitkv kernel (the two read the same BSHD paged cache, so switching
+ * costs no data movement). Measured on RTX 5090 via the dev_perf ctx sweep;
+ * the crossover moves with model geometry, so it is keyed on
+ * (hidden_size, num_hidden_layers, num_key_value_heads) and unmeasured
+ * geometries get SIZE_MAX (= never route, the status quo).
+ * Override with INFINILM_DECODE_CTX_THRESHOLD=<tokens> (<=0 disables routing).
+ */
+size_t decode_fa_ctx_threshold();
+
+/**
  * @brief Hybrid attention: prefill (and mixed batches) go to FlashAttention-2
  * varlen; pure decode steps reuse FA's paged cache update (BSHD layout) but
  * run the paged-attention decode kernel, which reads the BSHD cache via
  * strides and is faster than FA2's kvcache path at short/medium contexts.
+ * Long-context decode steps (max_sequence_length > decode_fa_ctx_threshold())
+ * go to FA's kvcache kernel instead.
  */
 class HybridAttentionImpl {
 public:
