@@ -35,6 +35,9 @@ InfiniLM 侧常用参数：
   kernel（经 strides 直读 FA 的 BSHD cache）的分离路由。5090 上为最优
   单配置（见 gap_analysis.md v9）。
 - `--only w2_long_prefill`：只跑指定负载（逗号分隔）。
+- `--concurrent-prefill-n N`：w5_concurrent_prefill 的并发长 prompt 条数
+  （默认 8，复用 w2 的 prompt 构造、逐条加不同前缀以避开 prefix caching
+  去重），chunked prefill 验收负载，`--only w5_concurrent_prefill` 单跑。
 - `--dump-outputs`：把每个请求的输出 token ids 记入 JSON，配合
   `compare_outputs.py a.json b.json ...` 做跨引擎/跨 backend 的贪心解码
   逐 token 对拍（exact match 数 + 最早分叉位置）。
@@ -47,6 +50,7 @@ InfiniLM 侧常用参数：
 | w2_long_prefill | 1 × ~2k tok prompt | 128 tok | prefill 吞吐 |
 | w3_batch32 | 32 × 短 prompt | 128 tok | 批处理总吞吐 |
 | w4_long_decode | 1 × 短 prompt | 1024 tok | 长生成 decode 稳定性 |
+| w5_concurrent_prefill | 8 × ~2k tok prompt 并发 | 128 tok | chunked prefill：并发长 prefill 不阻塞 decode（e2e wall time） |
 
 ## 公平性约定
 

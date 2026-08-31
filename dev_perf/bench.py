@@ -20,7 +20,13 @@ import os
 import sys
 import time
 
-from workload import WORKLOADS, MemSampler, ctx_sweep_workloads, resolve_model_path
+from workload import (
+    WORKLOADS,
+    MemSampler,
+    concurrent_prefill_workload,
+    ctx_sweep_workloads,
+    resolve_model_path,
+)
 
 # Checkout whose built infinilm package we benchmark. Defaults to this repo's
 # own python/ dir (where `xmake install _infinilm` lands its .so); override
@@ -156,7 +162,13 @@ def main():
     parser.add_argument(
         "--only",
         default=None,
-        help="comma-separated workload names to run (default: all four)",
+        help="comma-separated workload names to run (default: all)",
+    )
+    parser.add_argument(
+        "--concurrent-prefill-n",
+        type=int,
+        default=8,
+        help="number of concurrent long prompts in w5_concurrent_prefill",
     )
     parser.add_argument(
         "--attn-backend",
@@ -194,7 +206,16 @@ def main():
     mem_after_load = sampler.latest
     print(f"[bench] load took {load_seconds:.1f}s, mem={mem_after_load} MiB", flush=True)
 
-    workloads = ctx_sweep_workloads() if args.ctx_sweep else WORKLOADS
+    workloads = (
+        ctx_sweep_workloads()
+        if args.ctx_sweep
+        else [
+            concurrent_prefill_workload(args.concurrent_prefill_n)
+            if name == "w5_concurrent_prefill"
+            else (name, prompts, max_tokens)
+            for name, prompts, max_tokens in WORKLOADS
+        ]
+    )
 
     # Warmup (untimed): runs the first workload once to trigger lazy init /
     # graph capture.

@@ -34,12 +34,27 @@ def _batch_prompts(n: int) -> list[str]:
     return [f"问题 {i + 1}：{SHORT_PROMPTS[i % len(SHORT_PROMPTS)]}" for i in range(n)]
 
 
+def concurrent_prefill_workload(n: int = 8) -> tuple:
+    """w5: n long prompts (w2's LONG_PROMPT construction) submitted in one
+    batch — the chunked-prefill acceptance workload. With plain FCFS
+    scheduling the n-1 queued prefills block everyone's decode; chunked
+    prefill should interleave them and cut e2e wall time.
+
+    Each prompt gets a distinct 问题 i： header so they diverge from the
+    very first tokens — prefix caching (on for both engines) can then
+    never dedupe them, and every request pays its own full prefill.
+    """
+    prompts = [f"问题 {i + 1}：{LONG_PROMPT}" for i in range(n)]
+    return ("w5_concurrent_prefill", prompts, 128)
+
+
 # name, prompts, max_tokens
 WORKLOADS = [
     ("w1_short_decode", SHORT_PROMPTS[:1], 128),
     ("w2_long_prefill", [LONG_PROMPT], 128),
     ("w3_batch32", _batch_prompts(32), 128),
     ("w4_long_decode", SHORT_PROMPTS[1:2], 1024),
+    concurrent_prefill_workload(),
 ]
 
 
