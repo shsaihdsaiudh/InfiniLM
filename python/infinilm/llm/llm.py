@@ -156,8 +156,12 @@ class LLMEngine:
 
         由 env INFINILM_ENABLE_CHUNKED_PREFILL 打开（默认关闭，关闭时调度
         行为与旧逻辑一致）。以下路径保持整段 prefill 旧行为：
-        mamba/线性注意力模型、投机采样路径，以及按 batch 级 is_prefill
-        构建输入的处理器（多模态模型，混排会破坏其输入构建）。
+        mamba/线性注意力模型，以及按 batch 级 is_prefill 构建输入的处理
+        器（多模态模型，混排会破坏其输入构建）。
+
+        投机采样（eagle / prompt_lookup）不再互斥：SpeculativeRunner 按
+        SchedulerOutput.num_scheduled_tokens 逐请求判定阶段，混排批次里
+        的中段 chunk 请求不参与 draft/verify、也不产出 token。
         """
         if os.getenv("INFINILM_ENABLE_CHUNKED_PREFILL", "").lower() not in (
             "1",
@@ -166,7 +170,7 @@ class LLMEngine:
             "on",
         ):
             return False
-        if has_mamba_cache or config.draft_model_path is not None:
+        if has_mamba_cache:
             return False
         processor_cls = type(self.processor)
         return (
@@ -408,6 +412,7 @@ class LLM:
         self,
         model_path: str,
         draft_model_path: Optional[str] = None,
+        speculative_method: Optional[str] = None,
         num_draft_tokens: int = 4,
         device: str = "cuda",
         dtype: str = "float16",
@@ -440,6 +445,10 @@ class LLM:
 
         Args:
             model_path: Path to the model directory.
+            draft_model_path: Optional Eagle/MTP draft model directory.
+            speculative_method: Speculative decoding method ('eagle' or
+                'prompt_lookup'). 'prompt_lookup' needs no draft model.
+                Defaults to 'eagle' when draft_model_path is set.
             device: Device type ('cpu', 'cuda', 'mlu', 'moore').
             dtype: Data type ('float16', 'bfloat16', 'float32').
             tensor_parallel_size: Number of devices for tensor parallelism.
@@ -460,6 +469,7 @@ class LLM:
         config = EngineConfig(
             model_path=model_path,
             draft_model_path=draft_model_path,
+            speculative_method=speculative_method,
             num_draft_tokens=num_draft_tokens,
             device=device,
             dtype=dtype,
@@ -635,6 +645,7 @@ class AsyncLLMEngine:
         self,
         model_path: str,
         draft_model_path: Optional[str] = None,
+        speculative_method: Optional[str] = None,
         num_draft_tokens: int = 4,
         device: str = "cuda",
         dtype: str = "float16",
@@ -668,6 +679,10 @@ class AsyncLLMEngine:
 
         Args:
             model_path: Path to the model directory.
+            draft_model_path: Optional Eagle/MTP draft model directory.
+            speculative_method: Speculative decoding method ('eagle' or
+                'prompt_lookup'). 'prompt_lookup' needs no draft model.
+                Defaults to 'eagle' when draft_model_path is set.
             device: Device type ('cpu', 'cuda', 'mlu', 'moore').
             dtype: Data type ('float16', 'bfloat16', 'float32').
             tensor_parallel_size: Number of devices for tensor parallelism.
@@ -692,6 +707,7 @@ class AsyncLLMEngine:
         config = EngineConfig(
             model_path=model_path,
             draft_model_path=draft_model_path,
+            speculative_method=speculative_method,
             num_draft_tokens=num_draft_tokens,
             device=device,
             dtype=dtype,

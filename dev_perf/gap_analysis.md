@@ -1,10 +1,177 @@
 # 项目 #2 基线差距清单
 
-最新进展见 v15（2026-09-01）：decode step kernel 级归因（nsys graph-node
-级采集 + replay 分段）。修正此前"GEMV 仅 39% 带宽"的粗估：图内 GEMV
-实际 70~82% 带宽（gemvx，非 cutlass wmma——后者仅出现在 prefill/
-capture）；真实资金池按 0.6B 排序：小 kernel 延迟 ~30%、图外 CPU
-~20%、GEMV 70→92% ~16%。1.7B GEMV 已 82%，空间更小。
+最新进展见 v16（2026-09-01）：投机采样方向开工并已在 5090 验收——
+prompt-lookup（零训练、模型无关的 n-gram draft）+ spec×chunked 融合 +
+融合单前向（主采样与 draft 验证一次完成，纯 decode 批次形状固定
+b×(k+1)，为 verify 图化备好可录制形状）+ 自适应收益门控（低命中负载
+开投机不致亏）。纯 Python 实现，stub 测试 11 用例全绿；5090 实测
+w4/w5/w7 提速 2.1~2.4×、w6 吞吐 +57%、w1 打平，高命中负载输出与非
+投机逐 token 相同（开放生成的分歧定位为 near-tie argmax 翻转，非逻辑
+bug，详见 v16 验收结果节）。v15 的 kernel 级归因结论不变：小模型
+decode 的常数项（小 kernel 延迟 + 图外 CPU）决定了投机必须走融合
+单前向才有净收益。
+
+---
+
+## v16（2026-09-01）：prompt-lookup 投机采样 + spec×chunked 融合
+
+动机：v15 归因认定 kernel 微优化天花板清晰，数量级杠杆在 FP8 与投机
+采样。仓库已有投机链路（speculative_runner.py）但三个硬限制：draft
+只支持 minicpm_eagle（Qwen3-0.6B/1.7B 没有现成 EAGLE 头）、与 v13
+chunked prefill 在引擎 gate 互斥、且投机模式全程 eager（target 主前向
+走 forward_raw 拿 hidden states，被 rank_worker 的
+!sample_all_positions 门禁挡在图外）。v16 按分析的第一、三步落地
+（跳过需要训练的 EAGLE 头）：① prompt-lookup 打通链路，③ spec×
+chunked 融合 + verify 形状固定化。
+
+### 改动清单（全部纯 Python）
+
+- `config/engine_config.py`：新增 `speculative_method`（None/"eagle"/
+  "prompt_lookup"）；归一化——给了 `draft_model_path` 未指定方法时默认
+  "eagle"（旧调用方行为不变）；校验组合合法性。
+- `llm/model_runner/speculative_runner.py`：
+  - prompt_lookup draft：`_draft_prompt_lookup_tokens` 在请求自身
+    prompt+已生成序列中找当前后缀的最近一次出现，取其后 k 个 token
+    （n-gram 范围由 `INFINILM_PROMPT_LOOKUP_MIN/MAX_NGRAM` 控制，默认
+    2/4；只影响命中质量，正确性由 verify 保证）。
+  - **融合单前向**（`_forward_fused_prompt_lookup`）：纯 decode 批次时
+    每请求一行固定 k+1 个 token——[已提交尾 token x, d1..dk]（不足 k
+    个用尾 token 补齐，验证逻辑对任意 draft 内容自校正），一次前向同时
+    拿到主采样 o[0]（=target_token）与逐位置验证输出 o[1..k]，接受最长
+    匹配前缀+1 修正 token，未接受槽位 rollback。与两前向流程逐 token
+    等价，但省掉独立 verify 前向的 launch/CPU 常数项——这是 0.6B 级别
+    小模型上投机有没有净收益的分水岭（v15：eager 前向常数项与图化
+    decode 同量级）。
+  - 逐请求相位判定：`num_scheduled_tokens` 非空时按请求判断，中段
+    chunk 请求不产 token、不进 draft/verify（否则 append_verify_slots
+    会破坏块表不变量）；混排批次回退两前向流程。
+  - batch 阈值：`len(requests) > INFINILM_SPEC_MAX_BATCH_SIZE`（默认
+    32）回退常规前向——大 batch decode 转向计算受限，投机放大每步
+    计算量反而降吞吐（w3 bs=32 类负载的保护）。
+  - **自适应收益门控**：滑动窗口（`INFINILM_SPEC_GATE_WINDOW`，默认
+    32 请求步）内平均每步产出低于 `INFINILM_SPEC_MIN_AVG_TOKENS`
+    （默认 2.0，实测盈亏平衡点：eager 投机步成本 ≈ 2× 图化 decode
+    步）时回退常规前向 `INFINILM_SPEC_GATE_COOLDOWN` 步（默认 64），
+    期满自动重试。开放生成等低命中负载开投机不致亏（见验收结果）。
+  - verify 槽位分配失败（KV 块不足）退化为本请求不投机，不再抛异常。
+  - 接受率埋点：`get_acceptance_stats()`（drafted/accepted/accept_rate/
+    avg_tokens_per_step/verify_alloc_failures/gate_triggered），经
+    `ModelRunner.get_speculative_stats()` 暴露。
+- `llm/model_runner/model_runner.py`：投机开关从 `draft_model_path is
+  not None` 改为 `speculative_method is not None`。
+- `llm/llm.py`：LLM/AsyncLLMEngine 新增 `speculative_method` 参数；
+  **拆除 spec×chunked 互斥 gate**（`_chunked_prefill_supported` 不再
+  排除投机路径；mamba/多模态处理器的排除保留）。
+- `dev_perf/bench.py`：`--speculative-method {none,eagle,prompt_lookup}`
+  / `--draft-model` / `--num-draft-tokens`；每个 workload 记录
+  spec_accept_rate 与 spec_avg_tokens_per_step 增量并随 JSON 落盘。
+- `dev_perf/workload.py`：新增 w7_repetitive_copy（pattern 续写负载，
+  prompt-lookup 接受率上限的演示；不依赖指令遵循能力）。
+
+### 本机验证（无 GPU，stub 模式）
+
+`test/test_prompt_lookup_spec.py`（复用 test_chunked_prefill.py 的 stub
+harness，target 模型用确定性伪模型替代）7 用例 + 既有 4 用例全绿：
+
+- lookup 辅助函数语义（最近出现/min-max 边界/k 截断/未命中）；
+- 高命中场景输出与非投机真值逐 token 相同，accept_rate>0.9、
+  avg_tokens_per_step>1.4，且 decode 批次的 forward_raw 调用形状全是
+  b×(k+1)（证明走了融合路径）；
+- draft 整体拒绝/部分接受时输出仍精确、verify 槽位回滚、块无泄漏；
+- spec×chunked 混排：中段 chunk 产出 []、完成 chunk 即投机、混排批次
+  走两前向、纯 decode 批次走融合（按调用形状断言）；
+- 旧式整段 prefill 批次投机、非 greedy 回退；
+- 自适应门控：零命中负载攒满 32 步窗口后触发回退，冷静期内不再产生
+  融合前向调用，输出仍逐 token 精确。
+
+### 5090 验收步骤
+
+```bash
+# 基线（无投机）
+python dev_perf/bench.py --engine infinilm --model Qwen/Qwen3-0.6B \
+    --enable-graph --attn-backend hybrid \
+    --only w1_short_decode,w4_long_decode,w7_repetitive_copy --dump-outputs
+# 投机（prompt_lookup, k=4）
+python dev_perf/bench.py --engine infinilm --model Qwen/Qwen3-0.6B \
+    --enable-graph --attn-backend hybrid \
+    --speculative-method prompt_lookup --num-draft-tokens 4 \
+    --only w1_short_decode,w4_long_decode,w7_repetitive_copy --dump-outputs
+# 正确性：贪心输出必须逐 token 相同
+python dev_perf/compare_outputs.py results/infinilm_*baseline*.json results/infinilm_*spec*.json
+```
+
+看点：w7 的 spec_accept_rate 与 avg_tokens_per_step（预期接近 k）、
+w1/w4 的 ms/tok 差（开放生成接受率低，可能接近打平——这本身就是
+prompt-lookup 的已知边界，EAGLE 头是后续解）、w3 不回归（batch 阈值
+保护）。spec×chunked 组合验收：`INFINILM_ENABLE_CHUNKED_PREFILL=1` +
+`--speculative-method prompt_lookup` 跑 w5/w6 对拍。
+
+### 5090 验收结果（2026-09-01，Qwen3-0.6B，hybrid + graph，k=4）
+
+**性能**（该 VM 当天有分时 CPU 争抢，绝对 ms/tok 在观测窗口内漂过
+2~3×；表中为紧邻交错对拍的数字，比值才是可靠信号。接受率是确定性
+计数，多轮逐位相同）：
+
+| workload | 基线 | prompt_lookup | 收益 | accept | avg tok/step |
+|---|---|---|---|---|---|
+| w1_short_decode | 2.844 / 2.683 ms/tok | 2.791 / 2.692 | ≈打平（门控生效） | 0.781 | 1.68 |
+| w4_long_decode | 3.174 / 3.144 | 1.360 / 1.288 | **2.3~2.4×** | 0.982 | 4.49 |
+| w7_repetitive_copy | 3.169 / 3.176 | 1.427 / 1.401 | **2.2~2.3×** | 0.958 | 4.03 |
+| w5_concurrent_prefill（chunked） | 2.364 | 1.114 | **2.1×** | 0.926 | 4.57 |
+| w6_decode_stall（chunked） | 1564.6 tok/s | 2451.3 tok/s | **+57%** | — | — |
+
+门控的价值有直接对照：无门控的首轮（机器较空闲窗口）w1 从 1.744
+回归到 2.551 ms/tok（-46%，accept 仅 0.55）；加门控后 w1 与基线
+打平（128 个 token 里约 32+32 步投机探测，其余回退图化 decode），
+高命中负载不受影响。
+
+**正确性**：
+
+- 基线确定性成立：同配置连跑两次 w1/w4 输出逐 token 相同。
+- 全 exact：w7（512 tok）、w5（8/8 请求）——高命中负载里正确 token
+  的 logit 遥遥领先，数值噪声翻不动 argmax。
+- 非 exact：w1（token 9 分歧）、w4（token 32）、w6（7/9 exact，
+  最早 token 1）。定位为 **near-tie argmax 翻转**，非逻辑 bug：
+  - HF 探针实测分歧位置的 top-2 logit 间隙：w1 = 0.125、w4 = 0.000
+    （完全平局）；分歧两侧文本都通顺且语义等价（"对猫的误解" vs
+    "的好奇心"、"如何进行交流" vs "如何交流"）。
+  - 机制：spec 的 verify/融合前向与基线 decode 的 batch 形状不同
+    （b×(k+1) eager vs b×1 图化），归约顺序差异产生 O(0.01~0.1)
+    的数值噪声，足以翻转平局。w6 的 token-1 分歧是同一机制上移
+    一层：spec 改变各请求进度 → 混排批次组成不同 → 主前向数值微差。
+  - 结论：投机采样"数学无损"指分布等价，不是逐位等价（vLLM 同样
+    不保证逐位一致）。验收门槛应理解为：高命中负载必须 exact
+    （w5/w7 已满足），开放生成负载看分歧点 logit 间隙是否近平局。
+- 反面边界不变：大 batch（w3 bs=32 类）由 batch 阈值直接回退，不回归。
+
+**w1 类开放生成要真正获益，需要 EAGLE 头**（接受率 0.55 → 2.5~3.5
+才有净收益），这是后续项；prompt-lookup 的定位是把链路和验收跑通 +
+覆盖重复性负载（代码、总结、agent 循环输出）。
+
+### 遗留：verify/融合前向的 CUDA graph 录制（③b 的 C++ 半）
+
+融合前向目前 eager（sample_all_positions=True 被
+`csrc/engine/rank_worker.cpp:428` 的门禁挡在图外）。录图改动点
+（已定位，待有 GPU 构建环境时实施）：
+
+1. `rank_worker.cpp:428` 放宽 `!sample_all_positions` 门禁，让
+   all-position 输入可进编译器；
+2. `paged_compiler.cpp` 新增按 (batch, k+1) 键的 verify 图表（tuple
+   key 仿 static_batching_compiler.hpp:30），compile() 新增录制分支：
+   pack_i64/pack_i32 缓冲按 k+1 放大，录制输入置
+   `sample_all_positions=true`；
+3. `get_compiled` 的 decode-only 检查（`input_ids->size(1) != batch`）
+   改为分支：命中 (b,k+1) 表走 verify 图；
+4. hidden_states 不进图输出时 `forward_raw`（infer_engine.py）需容忍
+   null（runner 只消费 output_ids）；
+5. 隐性依赖：录制时冻结的 host 标量 max_query_length=k+1 没问题，
+   max_sequence_length 随 ctx 变化——需确认 FA varlen 路径不消费它做
+   内容相关分支；
+6. 配置链：k 需在编译期可知（LLM→EngineConfig→InferEngine→pybind→
+   RankWorker→PagedCompiler），或在首次遇到该形状时 lazy 录制。
+
+预期收益：融合前向图化后，0.6B decode 每步成本回到图化单前向量级，
+投机的理论收益（w1/w4 类小 batch 延迟敏感负载 2× 级）才完全兑现。
 
 ---
 

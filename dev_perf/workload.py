@@ -64,6 +64,16 @@ def decode_stall_workload(n_decode: int = 8, inject_reps: int = 80) -> tuple:
     return ("w6_decode_stall", (n_decode, inject_prompt), 0)
 
 
+def repetitive_copy_workload() -> tuple:
+    """w7: prompt-lookup 投机采样的收益负载——pattern 续写使输出大段
+    重复 prompt 内容，n-gram 后缀匹配持续命中（接受率上限的演示）。
+    用纯模式重复而非指令（"请重复 N 遍"），贪心小模型必然续写，
+    不依赖指令遵循能力。正确性由 verify 保证，与是否命中无关。
+    """
+    prompt = "下面这段文字会不断重复：\n" + _BASE_PARA * 3
+    return ("w7_repetitive_copy", [prompt], 512)
+
+
 # name, prompts, max_tokens
 WORKLOADS = [
     ("w1_short_decode", SHORT_PROMPTS[:1], 128),
@@ -72,6 +82,7 @@ WORKLOADS = [
     ("w4_long_decode", SHORT_PROMPTS[1:2], 1024),
     concurrent_prefill_workload(),
     decode_stall_workload(),
+    repetitive_copy_workload(),
 ]
 
 

@@ -76,6 +76,9 @@ def build_engine(args):
         from infinilm.llm.llm import LLM
         from infinilm.llm.sampling_params import SamplingParams
 
+        speculative_method = (
+            None if args.speculative_method == "none" else args.speculative_method
+        )
         llm = LLM(
             model_path=args.model,
             device="cuda",
@@ -86,6 +89,9 @@ def build_engine(args):
             num_blocks=args.num_blocks,
             enable_prefix_caching=True,
             enable_graph=args.enable_graph,
+            draft_model_path=args.draft_model,
+            speculative_method=speculative_method,
+            num_draft_tokens=args.num_draft_tokens,
         )
 
         def generate(prompts, max_tokens):
@@ -103,7 +109,23 @@ def build_engine(args):
         # w6_decode_stall drives the engine directly (mid-stream add_request)
         generate.llm = llm
 
-        engine_notes = {"engine": "infinilm", "cuda_graph": bool(args.enable_graph), "prefix_caching": True, "attn_backend": args.attn_backend, "num_blocks": args.num_blocks}
+        def spec_stats():
+            """投机采样累计计数快照；未启用投机时返回 None。"""
+            return llm.engine.model_runner.get_speculative_stats()
+
+        generate.spec_stats = spec_stats
+
+        engine_notes = {
+            "engine": "infinilm",
+            "cuda_graph": bool(args.enable_graph),
+            "prefix_caching": True,
+            "attn_backend": args.attn_backend,
+            "num_blocks": args.num_blocks,
+            "speculative_method": speculative_method,
+            "num_draft_tokens": (
+                args.num_draft_tokens if speculative_method else None
+            ),
+        }
 
     elif args.engine == "vllm":
         from vllm import LLM, SamplingParams
@@ -285,6 +307,23 @@ def main():
         help="infinilm only: attention backend",
     )
     parser.add_argument(
+        "--speculative-method",
+        default="none",
+        choices=["none", "eagle", "prompt_lookup"],
+        help="infinilm only: speculative decoding method (prompt_lookup needs no draft model)",
+    )
+    parser.add_argument(
+        "--draft-model",
+        default=None,
+        help="infinilm only: Eagle/MTP draft model directory (speculative-method=eagle)",
+    )
+    parser.add_argument(
+        "--num-draft-tokens",
+        type=int,
+        default=4,
+        help="infinilm only: draft tokens verified per speculative step",
+    )
+    parser.add_argument(
         "--ctx-sweep",
         action="store_true",
         help="replace the workload list with a decode-vs-context-length sweep "
@@ -313,6 +352,30 @@ def main():
     load_seconds = time.perf_counter() - t_load0
     mem_after_load = sampler.latest
     print(f"[bench] load took {load_seconds:.1f}s, mem={mem_after_load} MiB", flush=True)
+
+    def _spec_snapshot():
+        fn = getattr(generate, "spec_stats", None)
+        return fn() if fn is not None else None
+
+    def _spec_rec(before, after):
+        """本 workload 区间的投机采样增量统计；未启用投机时返回 None。"""
+        if after is None:
+            return None
+        before = before or {}
+        drafted = after["drafted_tokens"] - before.get("drafted_tokens", 0)
+        accepted = after["accepted_tokens"] - before.get("accepted_tokens", 0)
+        steps = after["spec_steps"] - before.get("spec_steps", 0)
+        emitted = after["emitted_tokens"] - before.get("emitted_tokens", 0)
+        alloc_fail = after["verify_alloc_failures"] - before.get(
+            "verify_alloc_failures", 0
+        )
+        return {
+            "spec_drafted_tokens": drafted,
+            "spec_accepted_tokens": accepted,
+            "spec_accept_rate": round(accepted / drafted, 4) if drafted else None,
+            "spec_avg_tokens_per_step": round(emitted / steps, 3) if steps else None,
+            "spec_verify_alloc_failures": alloc_fail,
+        }
 
     workloads = (
         ctx_sweep_workloads()
@@ -345,7 +408,9 @@ def main():
                     flush=True,
                 )
                 continue
+            spec_before = _spec_snapshot()
             rec = run_decode_stall(llm, prompts, dump_outputs=args.dump_outputs)
+            rec.update(_spec_rec(spec_before, _spec_snapshot()) or {})
             results.append(rec)
             print(
                 f"[bench] {name}: e2e={rec['e2e_seconds']:.2f}s "
@@ -358,6 +423,7 @@ def main():
                 flush=True,
             )
             continue
+        spec_before = _spec_snapshot()
         t0 = time.perf_counter()
         outputs = generate(prompts, max_tokens)
         e2e = time.perf_counter() - t0
@@ -376,13 +442,20 @@ def main():
             "min_output_tokens": min(out_token_counts),
             "max_output_tokens": max(out_token_counts),
         }
+        rec.update(_spec_rec(spec_before, _spec_snapshot()) or {})
         if args.dump_outputs:
             rec["output_token_ids"] = [list(o.outputs[0].token_ids) for o in outputs]
         results.append(rec)
+        spec_note = ""
+        if rec.get("spec_avg_tokens_per_step") is not None:
+            spec_note = (
+                f" spec_accept={rec['spec_accept_rate']}"
+                f" avg_tok/step={rec['spec_avg_tokens_per_step']}"
+            )
         print(
             f"[bench] {name}: e2e={e2e:.2f}s out={total_out} tok "
             f"({rec['output_tokens_per_sec']} tok/s, "
-            f"{rec['ms_per_output_token']} ms/tok)",
+            f"{rec['ms_per_output_token']} ms/tok){spec_note}",
             flush=True,
         )
 

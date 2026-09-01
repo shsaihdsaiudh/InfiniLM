@@ -44,6 +44,20 @@ InfiniLM 侧常用参数：
   考察注入前后 decode 流的最大/p90 ITL 尖峰与注入请求 TTFT——FCFS 下
   整条 decode 流被整段 prefill 堵住，chunked prefill 应把尖峰摊平。
   仅 infinilm 引擎支持（vLLM 跳过）。
+- `--speculative-method prompt_lookup`：开启投机采样（零训练 n-gram
+  draft，模型无关；`--num-draft-tokens K` 控制每步验证的 draft 数，默认
+  4；eagle 方法需 `--draft-model` 指向 MiniCPM Eagle 权重）。每个负载的
+  JSON 会带 spec_accept_rate / spec_avg_tokens_per_step 增量。相关 env：
+  `INFINILM_PROMPT_LOOKUP_MIN/MAX_NGRAM`（默认 2/4，匹配质量调参）、
+  `INFINILM_SPEC_MAX_BATCH_SIZE`（默认 32，超过则回退常规前向）、
+  `INFINILM_SPEC_MIN_AVG_TOKENS` / `_GATE_WINDOW` / `_GATE_COOLDOWN`
+  （默认 2.0/32/64，自适应收益门控：窗口内平均每步产出低于阈值则回退
+  常规前向一段再重试，低命中负载开投机不致亏）。
+  贪心下输出与非投机数学等价（分布无损），但**不保证逐位一致**：
+  verify 前向的 batch 形状与基线 decode 不同，logit 近平局的位置
+  argmax 可能翻转（实测分歧点 top-2 间隙 0~0.125）；高命中负载
+  （w5/w7）保持逐 token 相同。用 `--dump-outputs` + compare_outputs
+  对拍验收；w7_repetitive_copy 是接受率演示负载（见 gap_analysis.md v16）。
 - `--dump-outputs`：把每个请求的输出 token ids 记入 JSON，配合
   `compare_outputs.py a.json b.json ...` 做跨引擎/跨 backend 的贪心解码
   逐 token 对拍（exact match 数 + 最早分叉位置）。
@@ -58,6 +72,7 @@ InfiniLM 侧常用参数：
 | w4_long_decode | 1 × 短 prompt | 1024 tok | 长生成 decode 稳定性 |
 | w5_concurrent_prefill | 8 × ~2k tok prompt 并发 | 128 tok | chunked prefill：并发长 prefill 不阻塞 decode（e2e wall time） |
 | w6_decode_stall | 8 × 短 prompt 长 decode + 中途注入 1 × ~6.5k tok prompt | 512/32 tok | chunked prefill 收益场景：decode 流 ITL 尖峰、注入请求 TTFT |
+| w7_repetitive_copy | 1 × 重复段落 pattern 续写 | 512 tok | prompt-lookup 投机采样：n-gram 命中率高，接受率/收益演示 |
 
 ## 公平性约定
 
