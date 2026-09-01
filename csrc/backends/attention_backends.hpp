@@ -8,6 +8,14 @@ namespace infinilm::backends {
 
 /**
  * @brief Enumeration of all supported attention backends.
+ *
+ * 各后端说明：
+ * - STATIC_ATTN：静态 attention，prefill/decode 走同一套实现（默认）
+ * - PAGED_ATTN：自研 paged-attention，prefill 为 PagedAttentionPrefill，decode 为 splitkv
+ * - FLASH_ATTN：FlashAttention-2（mha_varlen_fwd / mha_fwd_kvcache）
+ * - FLASHINFER：FlashInfer 后端
+ * - HYBRID：按阶段分离路由——prefill 走 FA2 varlen，decode 走自研 paged kernel
+ *   （见 HybridAttentionImpl）
  */
 enum class AttentionBackend {
     STATIC_ATTN,
@@ -53,6 +61,7 @@ inline AttentionBackend parse_attention_backend(const std::string &backend) {
         return AttentionBackend::FLASHINFER;
     }
     if (backend == "hybrid") {
+        // "hybrid"：prefill→FA2 varlen，decode→自研 paged-attention（splitkv）
         return AttentionBackend::HYBRID;
     }
 

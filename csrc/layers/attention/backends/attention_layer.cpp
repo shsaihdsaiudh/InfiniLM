@@ -6,6 +6,9 @@
 
 namespace infinilm::layers::attention {
 
+// AttentionLayer 构造：按所选 attention backend 实例化对应的实现类，
+// 统一存入 attn_backend_impl_（std::variant），forward 时用 std::visit 分发。
+
 AttentionLayer::AttentionLayer(size_t num_heads,
                                size_t head_size,
                                float scale,
@@ -25,6 +28,7 @@ AttentionLayer::AttentionLayer(size_t num_heads,
         attn_backend_impl_ = std::make_shared<backends::FlashAttentionImpl>(num_heads, head_size, scale, num_kv_heads, layer_idx);
         break;
     case ::infinilm::backends::AttentionBackend::HYBRID:
+        // HYBRID：prefill 走 FA2，decode 走自研 paged-attention kernel（见下方 HybridAttentionImpl::forward）
         attn_backend_impl_ = std::make_shared<backends::HybridAttentionImpl>(num_heads, head_size, scale, num_kv_heads, layer_idx);
         break;
     default:
@@ -35,6 +39,8 @@ AttentionLayer::AttentionLayer(size_t num_heads,
 infinicore::Tensor AttentionLayer::forward(infinicore::Tensor &query,
                                            infinicore::Tensor &key,
                                            infinicore::Tensor &value) const {
+    // 从全局 forward 上下文中取出 attention 元数据与当前层的 KV cache，
+    // 再按 attn_backend_impl_ 的实际类型分发到对应后端的 forward。
     auto &forward_context = infinilm::global_state::get_forward_context();
     auto &attn_metadata = forward_context.attn_metadata;
     auto &kv_cache = forward_context.kv_cache_vec[layer_idx_];
@@ -78,6 +84,9 @@ size_t decode_fa_ctx_threshold() {
     return threshold;
 }
 
+// HybridAttentionImpl 构造：内部持有一个 FlashAttentionImpl 实例，
+// prefill 阶段的 mha_varlen_fwd 直接复用它；decode 阶段只用它的
+// do_kv_cache_update 写缓存（BSHD 布局），注意力计算走自研 paged kernel。
 HybridAttentionImpl::HybridAttentionImpl(size_t num_heads,
                                          size_t head_size,
                                          float scale,
@@ -94,28 +103,31 @@ infinicore::Tensor HybridAttentionImpl::forward(const AttentionLayer &layer,
                                                 const infinicore::Tensor &value,
                                                 infinicore::Tensor &kv_cache,
                                                 const infinilm::global_state::AttentionMetadata &attn_metadata) const {
-    // Same is_prefill test as the individual impls: in flattened paged mode,
-    // pure decode steps have exactly one query token per sequence.
+    // 与各独立 impl 相同的 prefill 判定：flattened paged 模式下，
+    // 纯 decode 步每个序列恰好只有一个 query token，
+    // 因此 query 行数 ≠ 序列数时即为 prefill（或含 prefill 的混合 batch）。
     const size_t seq_len = query->shape()[0];
     const bool is_prefill = (seq_len != attn_metadata.total_sequence_lengths.value()->shape()[0]);
     if (is_prefill) {
+        // prefill / 混合 batch：走 FA2 varlen（mha_varlen_fwd），prefill 性能最优。
         return flash_->forward(layer, query, key, value, kv_cache, attn_metadata);
     }
-    // Decode: at long contexts FA's kvcache kernel overtakes the paged
-    // splitkv kernel (measured crossover is model-geometry dependent).
-    // flash_->forward re-derives the decode case and runs mha_kvcache_ on
-    // the same BSHD cache, so routing costs no data movement.
+    // 长上下文 decode：FA 的 kvcache kernel 反超自研 splitkv（交叉点随模型
+    // 几何变化，见 decode_fa_ctx_threshold）。flash_->forward 会重新判定
+    // decode 分支并在同一份 BSHD cache 上跑 mha_kvcache_，切换无数据搬运。
     if (attn_metadata.max_sequence_length > decode_fa_ctx_threshold()) {
         return flash_->forward(layer, query, key, value, kv_cache, attn_metadata);
     }
-    // Decode: reuse FA's cache update (BSHD layout + permuted paged_caching_),
-    // then run the stride-agnostic paged-attention decode kernel directly.
+    // 纯 decode：复用 FA 的 cache update（BSHD 布局 + permuted paged_caching_ 写入），
+    // 然后直接调 stride 感知的 paged-attention decode kernel（splitkv）。
+    // FA2 的 mha_fwd_kvcache 是 sm80 时代的 kernel，在 Blackwell 上 decode 显著偏慢，
+    // 短/中上下文下自研 paged kernel 更快——这正是 HYBRID 的动机。
     auto [k_total, v_total] = flash_->do_kv_cache_update(layer, key, value, kv_cache, attn_metadata.slot_mapping.value());
     const size_t value_head_dim = value->size(value->ndim() - 1);
     auto attn_output = infinicore::Tensor::empty({seq_len, num_heads_, value_head_dim}, query->dtype(), query->device());
-    // The paged kernel expects shape [num_blocks, num_kv_heads, block_size, head_dim]
-    // (BHSD) but is fully strided, so a permuted view of the BSHD cache works
-    // without any data movement.
+    // paged kernel 期望的 shape 是 [num_blocks, num_kv_heads, block_size, head_dim]
+    // （BHSD），但 descriptor 逐维取 stride、kernel 按 row_stride 寻址，
+    // 因此对 BSHD 的 cache 做 permute({0,2,1,3}) 逻辑视图即可零拷贝直读。
     infinicore::op::paged_attention_(
         attn_output,
         query,
@@ -125,6 +137,7 @@ infinicore::Tensor HybridAttentionImpl::forward(const AttentionLayer &layer,
         attn_metadata.total_sequence_lengths.value(),
         std::nullopt,
         scale_);
+    // 展平成模型层期望的 [1, seq_len, hidden] 输出。
     return attn_output->view({1, seq_len, num_heads_ * value_head_dim});
 }
 

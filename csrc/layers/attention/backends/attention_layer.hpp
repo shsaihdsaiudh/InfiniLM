@@ -34,6 +34,10 @@ size_t decode_fa_ctx_threshold();
  * strides and is faster than FA2's kvcache path at short/medium contexts.
  * Long-context decode steps (max_sequence_length > decode_fa_ctx_threshold())
  * go to FA's kvcache kernel instead.
+ *
+ * 动机：5090（Blackwell）上 FA2 decode 显著慢于自研 splitkv（v8 实测
+ * -35%~-50%），FA 只赢 prefill，故按阶段分离路由；长上下文时 FA 的
+ * kvcache kernel 反超，交叉点随模型几何变化，见 decode_fa_ctx_threshold()。
  */
 class HybridAttentionImpl {
 public:
@@ -51,7 +55,7 @@ public:
                                const infinilm::global_state::AttentionMetadata &attn_metadata) const;
 
 private:
-    std::shared_ptr<FlashAttentionImpl> flash_;
+    std::shared_ptr<FlashAttentionImpl> flash_; // 复用的 FA2 实现：prefill 计算 + decode 阶段写 KV cache
     size_t num_heads_;
     size_t head_size_;
     float scale_;
@@ -59,6 +63,7 @@ private:
 
 } // namespace backends
 
+// 后端实现的类型集合：static / paged / flash / hybrid，forward 时按实际类型分发
 using AttentionImpl = std::variant<std::shared_ptr<backends::StaticAttentionImpl>, std::shared_ptr<backends::PagedAttentionImpl>, std::shared_ptr<backends::FlashAttentionImpl>, std::shared_ptr<backends::HybridAttentionImpl>>;
 
 /**
