@@ -48,6 +48,22 @@ def concurrent_prefill_workload(n: int = 8) -> tuple:
     return ("w5_concurrent_prefill", prompts, 128)
 
 
+def decode_stall_workload(n_decode: int = 8, inject_reps: int = 80) -> tuple:
+    """w6: the chunked-prefill *benefit* scenario — a steady decode stream
+    (n_decode short prompts, long generation) with one long prompt injected
+    mid-flight. Plain FCFS stalls every decode token for the whole injected
+    prefill; chunked prefill should spread it into mixed steps and shrink the
+    ITL spike. bench.py drives this engine-level (add_request/step); the
+    prompts/max_tokens fields are placeholders, parameters ride in the tuple.
+
+    The injected prompt gets a unique nonce header so prefix caching (w2/w5
+    ran earlier in the same engine) can never dedupe its blocks: the nonce
+    shifts every 256-token block boundary vs any earlier LONG_PROMPT use.
+    """
+    inject_prompt = f"w6注入{time.time_ns()}：" + _BASE_PARA * inject_reps
+    return ("w6_decode_stall", (n_decode, inject_prompt), 0)
+
+
 # name, prompts, max_tokens
 WORKLOADS = [
     ("w1_short_decode", SHORT_PROMPTS[:1], 128),
@@ -55,6 +71,7 @@ WORKLOADS = [
     ("w3_batch32", _batch_prompts(32), 128),
     ("w4_long_decode", SHORT_PROMPTS[1:2], 1024),
     concurrent_prefill_workload(),
+    decode_stall_workload(),
 ]
 
 

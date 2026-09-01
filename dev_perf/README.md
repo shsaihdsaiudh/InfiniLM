@@ -38,6 +38,12 @@ InfiniLM 侧常用参数：
 - `--concurrent-prefill-n N`：w5_concurrent_prefill 的并发长 prompt 条数
   （默认 8，复用 w2 的 prompt 构造、逐条加不同前缀以避开 prefix caching
   去重），chunked prefill 验收负载，`--only w5_concurrent_prefill` 单跑。
+- `--decode-stall-n N`：w6_decode_stall 的 decode 长流并发数（默认 8）。
+  w6 是引擎级负载：N 条短 prompt 各生成 512 tok，第 64 步时注入一条
+  ~6.5k tok 长 prompt（带 nonce 头避开 prefix caching），记录逐步耗时，
+  考察注入前后 decode 流的最大/p90 ITL 尖峰与注入请求 TTFT——FCFS 下
+  整条 decode 流被整段 prefill 堵住，chunked prefill 应把尖峰摊平。
+  仅 infinilm 引擎支持（vLLM 跳过）。
 - `--dump-outputs`：把每个请求的输出 token ids 记入 JSON，配合
   `compare_outputs.py a.json b.json ...` 做跨引擎/跨 backend 的贪心解码
   逐 token 对拍（exact match 数 + 最早分叉位置）。
@@ -51,6 +57,7 @@ InfiniLM 侧常用参数：
 | w3_batch32 | 32 × 短 prompt | 128 tok | 批处理总吞吐 |
 | w4_long_decode | 1 × 短 prompt | 1024 tok | 长生成 decode 稳定性 |
 | w5_concurrent_prefill | 8 × ~2k tok prompt 并发 | 128 tok | chunked prefill：并发长 prefill 不阻塞 decode（e2e wall time） |
+| w6_decode_stall | 8 × 短 prompt 长 decode + 中途注入 1 × ~6.5k tok prompt | 512/32 tok | chunked prefill 收益场景：decode 流 ITL 尖峰、注入请求 TTFT |
 
 ## 公平性约定
 

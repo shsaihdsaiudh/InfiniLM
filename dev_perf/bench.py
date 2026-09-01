@@ -21,10 +21,12 @@ import sys
 import time
 
 from workload import (
+    SHORT_PROMPTS,
     WORKLOADS,
     MemSampler,
     concurrent_prefill_workload,
     ctx_sweep_workloads,
+    decode_stall_workload,
     resolve_model_path,
 )
 
@@ -98,6 +100,9 @@ def build_engine(args):
         def close():
             llm.close()
 
+        # w6_decode_stall drives the engine directly (mid-stream add_request)
+        generate.llm = llm
+
         engine_notes = {"engine": "infinilm", "cuda_graph": bool(args.enable_graph), "prefix_caching": True, "attn_backend": args.attn_backend, "num_blocks": args.num_blocks}
 
     elif args.engine == "vllm":
@@ -132,6 +137,103 @@ def build_engine(args):
         raise ValueError(f"unknown engine: {args.engine}")
 
     return generate, close, engine_notes
+
+
+def run_decode_stall(llm, params, dump_outputs=False):
+    """w6 driver: steady decode stream + one long prompt injected mid-flight.
+
+    n_decode short-prompt requests generate 512 tokens each; after
+    INJECT_AFTER_STEPS engine steps one long prompt is added. Per-step wall
+    times are recorded so the injected prefill shows up as an ITL spike for
+    the decode stream (plain FCFS) or as a few mildly-longer mixed steps
+    (chunked prefill). Returns a bench record dict.
+    """
+    from infinilm.llm.request import InferenceRequest
+    from infinilm.llm.sampling_params import SamplingParams
+
+    n_decode, inject_prompt = params
+    decode_max_tokens = 512
+    inject_after_steps = 64
+    inject_max_tokens = 32
+
+    engine = llm.engine
+
+    def add(prompt, max_tokens, tag):
+        req = InferenceRequest(
+            request_id=f"w6-{tag}-{time.time_ns()}",
+            prompt=prompt,
+            prompt_token_ids=engine.tokenize(prompt),
+            sampling_params=SamplingParams(
+                temperature=0.0, top_k=1, max_tokens=max_tokens, ignore_eos=True
+            ),
+            eos_token_ids=engine.eos_token_ids,
+        )
+        engine.add_request(req)
+        return req
+
+    decode_reqs = [
+        add(f"w6问题 {i + 1}：{SHORT_PROMPTS[i % len(SHORT_PROMPTS)]}",
+            decode_max_tokens, f"d{i}")
+        for i in range(n_decode)
+    ]
+    injected = None
+    t_inject = None
+    inject_ttft = None
+    step_times = []
+    inject_step_idx = None
+
+    t_start = time.perf_counter()
+    while True:
+        t0 = time.perf_counter()
+        did_work, _ = engine.step()
+        dt = time.perf_counter() - t0
+        if did_work:
+            step_times.append(dt)
+        if injected is None and len(step_times) >= inject_after_steps:
+            injected = add(inject_prompt, inject_max_tokens, "p")
+            t_inject = time.perf_counter()
+            inject_step_idx = len(step_times)
+        if (
+            injected is not None
+            and inject_ttft is None
+            and injected.get_num_generated_tokens() >= 1
+        ):
+            inject_ttft = time.perf_counter() - t_inject
+        if all(r.is_finished() for r in decode_reqs) and (
+            injected is None or injected.is_finished()
+        ):
+            break
+    e2e = time.perf_counter() - t_start
+
+    pre = step_times[:inject_step_idx]
+    post = step_times[inject_step_idx:]
+    post_sorted = sorted(post)
+    p90 = post_sorted[int(len(post_sorted) * 0.9)] if post_sorted else 0.0
+
+    all_reqs = decode_reqs + ([injected] if injected else [])
+    out_token_counts = [r.get_num_generated_tokens() for r in all_reqs]
+    total_out = sum(out_token_counts)
+    rec = {
+        "workload": "w6_decode_stall",
+        "num_requests": len(all_reqs),
+        "prompt_tokens_total": sum(len(r.prompt_token_ids) for r in all_reqs),
+        "output_tokens_total": total_out,
+        "e2e_seconds": round(e2e, 3),
+        "output_tokens_per_sec": round(total_out / e2e, 2),
+        "ms_per_output_token": round(1000.0 * e2e / max(total_out, 1), 3),
+        "min_output_tokens": min(out_token_counts),
+        "max_output_tokens": max(out_token_counts),
+        # decode-stream smoothness: mean step time before injection vs the
+        # worst/p90 step after the long prompt lands
+        "decode_step_ms_pre_inject": round(1000.0 * sum(pre) / max(len(pre), 1), 3),
+        "step_ms_post_inject_max": round(1000.0 * max(post), 2) if post else None,
+        "step_ms_post_inject_p90": round(1000.0 * p90, 2),
+        "inject_prompt_tokens": len(injected.prompt_token_ids) if injected else 0,
+        "inject_ttft_ms": round(1000.0 * inject_ttft, 1) if inject_ttft else None,
+    }
+    if dump_outputs:
+        rec["output_token_ids"] = [list(r.generated_token_ids) for r in all_reqs]
+    return rec
 
 
 def main():
@@ -169,6 +271,12 @@ def main():
         type=int,
         default=8,
         help="number of concurrent long prompts in w5_concurrent_prefill",
+    )
+    parser.add_argument(
+        "--decode-stall-n",
+        type=int,
+        default=8,
+        help="number of streaming decode requests in w6_decode_stall",
     )
     parser.add_argument(
         "--attn-backend",
@@ -212,6 +320,8 @@ def main():
         else [
             concurrent_prefill_workload(args.concurrent_prefill_n)
             if name == "w5_concurrent_prefill"
+            else decode_stall_workload(args.decode_stall_n)
+            if name == "w6_decode_stall"
             else (name, prompts, max_tokens)
             for name, prompts, max_tokens in WORKLOADS
         ]
@@ -226,6 +336,27 @@ def main():
     results = []
     for name, prompts, max_tokens in workloads:
         if only and name not in only:
+            continue
+        if name == "w6_decode_stall":
+            llm = getattr(generate, "llm", None)
+            if llm is None:
+                print(
+                    f"[bench] {name}: skipped (engine exposes no raw llm handle)",
+                    flush=True,
+                )
+                continue
+            rec = run_decode_stall(llm, prompts, dump_outputs=args.dump_outputs)
+            results.append(rec)
+            print(
+                f"[bench] {name}: e2e={rec['e2e_seconds']:.2f}s "
+                f"out={rec['output_tokens_total']} tok "
+                f"({rec['output_tokens_per_sec']} tok/s) "
+                f"step pre={rec['decode_step_ms_pre_inject']}ms "
+                f"post_max={rec['step_ms_post_inject_max']}ms "
+                f"post_p90={rec['step_ms_post_inject_p90']}ms "
+                f"inject_ttft={rec['inject_ttft_ms']}ms",
+                flush=True,
+            )
             continue
         t0 = time.perf_counter()
         outputs = generate(prompts, max_tokens)

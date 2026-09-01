@@ -1,14 +1,122 @@
 # 项目 #2 基线差距清单
 
-最新结论见 v12（2026-08-29）：decode 按 ctx 长度自适应路由落地——
-hybrid 长 ctx decode 自动切 FA kvcache（与 splitkv 读同一块 BSHD
-cache，零数据转换），阈值按模型几何查表（5090 实测交叉点
-0.6B≈3.4k / 1.7B≈1.5k），未测几何默认不路由。1.7B w2 倒退根治：
-0.74→0.55s（-26%），路由后输出与 flash-attn 后端逐 token 全 exact；
-0.6B 四负载零回退（逐 token 全 exact）。v11 图外开销（打包 H2D +
-采样伴随图）正确性全 exact、e2e 收益在热噪声内。v10 全栈对照结论
-（vLLM 0.28 全面领先）不变；下一步主战场：bs×ctx 第三象限网格扫描
-与长 ctx 多并发对 vLLM 对照。
+最新进展见 v15（2026-09-01）：decode step kernel 级归因（nsys graph-node
+级采集 + replay 分段）。修正此前"GEMV 仅 39% 带宽"的粗估：图内 GEMV
+实际 70~82% 带宽（gemvx，非 cutlass wmma——后者仅出现在 prefill/
+capture）；真实资金池按 0.6B 排序：小 kernel 延迟 ~30%、图外 CPU
+~20%、GEMV 70→92% ~16%。1.7B GEMV 已 82%，空间更小。
+
+---
+
+## v15（2026-09-01）：bs=1 decode step 的 kernel 级归因
+
+动机：w1 实测（0.6B 1.74ms/tok）对带宽 roofline（~1.2GB/step ÷
+1.79TB/s ≈ 0.67ms）看似只有 39% 达成率，需定位缺口再定优化方向。
+
+### 方法
+
+nsys `-t cuda --cuda-graph-trace=node` 采集 w1（graph 模式）；
+`graphNodeId IS NOT NULL` 过滤图内 kernel，按 >100µs 时间间隙切
+replay（两模式 342 kernel/replay，稳态 254 个 replay），逐步中位数
+统计。分析脚本 `/root/step_breakdown{,2..5}.py`（5090），profile：
+`/root/prof_w1_06b_n.nsys-rep`、`/root/prof_w1_17b.nsys-rep`。
+
+### 0.6B decode step（wall 1390µs，busy 1357µs，图内 idle 仅 2%）
+
+| kernel | µs/step | n/step | µs/call | 推断调用点 | 字节 | 带宽达成 |
+|---|---|---|---|---|---|---|
+| gemvx g(768) | 277.7 | 28 | 9.92 | gate_up [1024→6144] | 12.6MB | 1.27 TB/s (71%) |
+| gemvx g(256) | 272.4 | 56 | 4.86 | o + down (N=1024) | 4.2/6.3MB | ~1.08 TB/s (60%) |
+| gemvx g(512) | 203.6 | 28 | 7.27 | qkv [1024→4096] | 8.4MB | 1.15 TB/s (64%) |
+| gemvx g(18992) | 189.9 | 1 | 189.9 | lm_head [1024→151936] | 311MB | **1.64 TB/s (92%)** |
+| add_rmsnorm | 104.7 | 56 | 1.87 | residual+norm | ~KB 级 | 纯延迟 |
+| paged splitkv cta+combine | 155.7 | 56 | — | decode attention | KV 小 | — |
+| pagedCaching | 42.3 | 28 | 1.51 | KV 写入 | 小 | 纯延迟 |
+| rmsNormRope ×2 | 70.7 | 56 | 1.2~1.3 | q/k norm+rope | 小 | 纯延迟 |
+| SwiGLU | 33.8 | 28 | 1.21 | MLP 激活 | 小 | 纯延迟 |
+| sampling/embedding | ~6.5 | — | — | 含伴随图 argmax | — | — |
+
+### 1.7B decode step（wall 2815µs，busy 2785µs）
+
+GEMV 合计 2353µs / 3.44GB = **1.46 TB/s (82%)**：gate_up 89%、
+qkv 75%、o+down 71%、lm_head 92%。小 kernel 合计 ~432µs (15%)。
+
+### 归因结论（修正粗估）
+
+1. **GEMV 并不烂**：decode 用 cuBLAS gemvx，大矩阵贴近实测峰值
+   （lm_head 92% ≈ 实用上限 1.65TB/s）；小矩阵（o/down/qkv）60~75%，
+   是 launch ramp + 矩阵太小的物理下限，可榨空间 ~10~16%（0.6B）。
+2. **0.6B 的三个真实资金池**（按大小）：
+   - 小 kernel 延迟 ~413µs（30%）：225 个 1~2µs 级 kernel 的 dispatch
+     地板。融合方向：add_rmsnorm 进 GEMV epilogue、pagedCaching 进
+     rope/attention、SwiGLU 并进 down epilogue。预期回收 ~200µs。
+   - 图外 CPU ~0.35ms/step（20%，bench 1.74ms − 图 1.39ms）：打包
+     H2D + graphLaunch + Python 调度。结构性解法 = async scheduling
+     （step N 执行时跑 step N+1 的调度/更新，vLLM 0.9 同款）。
+   - GEMV 70→85~92%：~150~220µs，需自研 split-K GEMV 或 cuBLASLt
+     启发式调优，收益上限最小。
+3. **1.7B 空间更小**：GEMV 已 82%，小 kernel 15%——bs=1 小模型的
+   常数项随模型变大被摊薄，**kernel 微优化路线天花板清晰可见**。
+4. 真正的数量级杠杆仍在 **FP8 权重/KV**（带宽减半，与上述乘算；
+   lm_head 一项即占 14% step，FP8 后立省 ~95µs@0.6B）与**投机采样**
+   （decode 2× 级）。两者基建已在仓库（quantization_method /
+   kv_cache_k_scale / draft_model_path / speculative_cache_ops）。
+
+---
+
+## v14（2026-09-01）：v13 5090 复核 + w6 decode-stall 负载
+
+动机：v13（chunked prefill + prefill/decode 混排）提交时仅有本机
+Python 单测，GPU 侧未验证；且验收负载 w5 是「同时到达」形态，测
+不出混排的真实收益（decode 流被长 prefill 队头阻塞的场景）。
+
+### 部署与正确性（5090，hybrid+graph，64blk，prefix caching 开）
+
+远端 `/root/src/InfiniLM-hybrid` 为 v12 等价树（md5 逐文件比对），
+v13 纯 Python，推 6 文件复用 C++ binary。llm.py 上 v11 遗留的
+stepprof 插桩 patch 被 v13 版覆盖（已备份 llm.py.stepprof.bak）。
+
+- gate 探针确认：`INFINILM_ENABLE_CHUNKED_PREFILL=1` 时
+  `enable_chunked_prefill=True`（注意 bench 下 logging 不出 INFO，
+  「Chunked prefill enabled」日志不可见，只能用探针确证）。
+- 0.6B 全负载矩阵（w1~w5，budget=1024 强制切块 vs 关 vs 默认
+  budget）：三组两两对拍均 43/43 请求逐 token exact。
+- 1.7B w2+w5（budget=1024，on vs off）：9/9 exact。
+- 远端 test_chunked_prefill.py 4 用例全绿。
+
+### w6_decode_stall：decode 长流 + 中途注入长 prefill
+
+形态：8 条短 prompt 各 decode 512 tok，第 64 步注入 1 条 ~6.5k tok
+prompt（nonce 头避开 prefix caching），逐步计时。budget=1024。
+
+| 指标 | 0.6B 关 | 0.6B 开 | 1.7B 关 | 1.7B 开 |
+|---|---|---|---|---|
+| decode 步均值（注入前） | 2.4~2.5ms | 2.6~2.8ms | 4.0~4.1ms | 4.1ms |
+| 注入后最大步长 | 75.9/74.9ms | 21.8/19.4ms | 138.6ms | 31.3ms |
+| 注入后 p90 步长 | 2.9ms | 3.2ms | 4.4ms | 4.4ms |
+| 注入请求 TTFT | 75.9ms | 106.1ms | 138.6ms | 185.2ms |
+| e2e | 1.56s | 1.61/1.62s | 2.40s | 2.41s |
+
+结论：chunked 把 decode 流最坏 ITL 尖峰削 **3.5×（0.6B）/ 4.4×
+（1.7B）**，p90 几乎不动；代价是注入请求 TTFT +40%/+34% 与 e2e
+~3%（切块后小 kernel + 混排 eager 步的开销）。w5（同时到达形态）
+ABBA 下 e2e 反而亏 ~5%（无 decode 流量可保护）——chunked 的价值
+在在线服务的延迟平稳性，不在离线批量吞吐。
+
+### 1.7B w6 的 on/off 分歧归因（非逻辑 bug）
+
+on vs off 出现 5~6/9 exact、token 80~108 分叉。排查链：off×3 两两
+9/9 exact；on×2（同配置）9/9 exact（on 模式确定性）；关 v12 ctx
+路由（INFINILM_DECODE_CTX_THRESHOLD=999999）后 on vs off 仍
+5/9@80；路由开/关的 on 两跑互对 5/9@80。结论：混排步中 decode
+token 走 eager varlen（而非 decode 图），叠加 6.5k ctx 触发 v12
+FA 路由，kernel 归约顺序差的 epsilon 被贪心放大——与 v9/v11 已
+接受的 kernel 切换分歧同类。0.6B 全 exact；1.7B w5（纯 prefill
+切块，无 decode 混排）9/9 exact 说明切块逻辑本身无数值偏差。
+
+数据归档：`results/5090_v13_chunked/`（23 份：全矩阵×4、w5
+ABBA×4、1.7B w2/w5×2、w6 0.6B×4、w6 1.7B×5）。远端遗留
+run_bench.py / probe_gate.py / llm.py.stepprof.bak。
 
 ---
 
