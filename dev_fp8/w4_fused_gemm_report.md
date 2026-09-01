@@ -49,5 +49,5 @@ W3 目标(decode ≥ BF16 的 80%)由 30.9% → **155%** 达成并反超。
 
 - bs ≥ 16 的 M_TILE tensor-core 化(目标追回 33%→≥80%)
 - prefill 融合(M 大,naive 已达 90.5% BF16,优先级低)
-- C-Eval/MMLU、vLLM 对照(W3 遗留,仍未做)
+- C-Eval/MMLU、vLLM 对照 ✅ W5 已补齐(见 w5_eval_report.md)
 - metax 后端(提案加分项)

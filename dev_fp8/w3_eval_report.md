@@ -43,10 +43,10 @@
 | W3 项 | 状态 |
 |---|---|
 | wikitext2 PPL < 1% | ✅ 0.082% |
-| decode ≥ 80% BF16 | ❌ 31%(如实记录,转 W4) |
+| decode ≥ 80% BF16 | ✅ W4 融合路径达成(30.9% → 155%,见 w4_fused_gemm_report.md) |
 | 显存 ≤ 60% | ✅ 55.6% |
-| C-Eval/MMLU | ⏸ 未做(服务器时长限制,follow-up) |
-| vLLM 同权重对照 | ⏸ 未做(服务器无 vLLM 环境,follow-up) |
+| C-Eval/MMLU | ✅ W5 补齐:C-Eval +0.37pt / MMLU −0.21pt(见 w5_eval_report.md) |
+| vLLM 同权重对照 | ✅ W5 补齐:精度 parity;decode bs=1 达 vLLM 91% |
 
 **W4 优先级**:
 1. 融合 FP8 GEMM 落地(先核实 marlin 块级 scale 支持,见提案 §6 风险 1)——decode 预期从 31% 提升到 ≥100%

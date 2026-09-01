@@ -1,7 +1,7 @@
 # FP8 块量化权重执行路径 — 立项草案
 
 > 项目方向:训练营项目 #4(量化与低精度推理)
-> 状态:W1–W4 主体完成。W3(5090):PPL 偏差 0.082% 达标,权重体积 55.6% 达标;W4:自研 `fp8_blockwise_gemm` 融合算子落地(InfiniCore 1f92d7c6),decode bs=1 **142.96 tok/s = BF16 的 155%**(naive 的 5.02×),bs=8 411.75;bs≥16 走 naive 路由(428.54)。marlin 路线因 InfiniCore kernel sm_120 缺陷搁置(dev_fp8/marlin_sm120_issue.md)。详见 dev_fp8/w3_eval_report.md 与 dev_fp8/w4_fused_gemm_report.md。后续:M_TILE tensor-core 化、C-Eval/MMLU、vLLM 对照、metax 后端
+> 状态:W1–W4 主体完成,W5 评测补齐完成(2026-08-31)。精度:PPL +0.082%、C-Eval +0.37pt、MMLU −0.21pt(全量),与 vLLM 0.28 同权重 parity;性能:decode bs=1 **142.96 tok/s = BF16 的 155%**(naive 的 5.02×,vLLM FP8 的 91%),bs=4 持平反超,bs≥8 落后 vLLM 3-5.4×(M_TILE tensor-core 化空间);显存 55.6% 达标。marlin 路线因 InfiniCore kernel sm_120 缺陷搁置(dev_fp8/marlin_sm120_issue.md)。详见 dev_fp8/w3_eval_report.md、w4_fused_gemm_report.md、w5_eval_report.md。后续:M_TILE tensor-core 化、prefill 融合、metax 后端、KV cache FP8(候选新方向)
 > 分支:feat/fp8-blockwise-quantization(配套 InfiniCore 分支 feat/fp8-blockwise-dequantize;worktree: ../InfiniLM-fp8)
 > 日期:2026-08-23
 

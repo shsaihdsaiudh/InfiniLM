@@ -1,0 +1,9 @@
+===== PERF BF16 bs=4 in=128 out=256 =====
+ load weights over! 4741.580247879028 ms 
+ Prefill TTFT: 54.87 ms  Throughput: 9331.56 tok/s
+ Decode  Avg ITL: 11.41 ms   Throughput: 350.64 tok/s
+===== PERF BF16 bs=8 in=128 out=256 =====
+ load weights over! 4651.002407073975 ms 
+ Prefill TTFT: 120.55 ms  Throughput: 8494.26 tok/s
+ Decode  Avg ITL: 11.65 ms   Throughput: 686.52 tok/s
+PERF_BS48_DONE
