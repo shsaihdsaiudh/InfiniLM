@@ -30,6 +30,8 @@ def parse_dtype(dtype_str: str):
         return infinicore.float16
     elif dtype_str == "bfloat16":
         return infinicore.bfloat16
+    elif dtype_str in ("fp8", "float8"):
+        return infinicore.float8
     elif dtype_str == "int8":
         return infinicore.int8
     elif dtype_str == "int32":

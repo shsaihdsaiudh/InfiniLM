@@ -17,6 +17,7 @@ enum class QuantScheme {
 enum class KVQuantAlgo {
     NONE,
     INT8,
+    FP8,
 };
 
 } // namespace infinilm::quantization

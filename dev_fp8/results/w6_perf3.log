@@ -1,0 +1,33 @@
+===== PERF KVBF16 bs=1 in=1024 out=128 =====
+ Prefill TTFT: 170.26 ms  Throughput: 6014.48 tok/s
+ Decode  Avg ITL: 7.72 ms   Throughput: 129.54 tok/s
+===== PERF KVFP8 bs=1 in=1024 out=128 =====
+ Prefill TTFT: 175.07 ms  Throughput: 5848.95 tok/s
+ Decode  Avg ITL: 10.79 ms   Throughput: 92.67 tok/s
+===== PERF KVBF16 bs=8 in=1024 out=128 =====
+ Prefill TTFT: 946.97 ms  Throughput: 8650.74 tok/s
+ Decode  Avg ITL: 20.84 ms   Throughput: 383.79 tok/s
+===== PERF KVFP8 bs=8 in=1024 out=128 =====
+ Prefill TTFT: 965.77 ms  Throughput: 8482.39 tok/s
+ Decode  Avg ITL: 23.44 ms   Throughput: 341.3 tok/s
+===== PERF KVBF16 bs=1 in=4096 out=128 =====
+ Prefill TTFT: 821.86 ms  Throughput: 4983.81 tok/s
+ Decode  Avg ITL: 10.53 ms   Throughput: 94.96 tok/s
+===== PERF KVFP8 bs=1 in=4096 out=128 =====
+ Prefill TTFT: 831.48 ms  Throughput: 4926.17 tok/s
+ Decode  Avg ITL: 21.65 ms   Throughput: 46.19 tok/s
+===== PERF KVBF16 bs=8 in=4096 out=128 =====
+ Prefill TTFT: 6309.42 ms  Throughput: 5193.51 tok/s
+ Decode  Avg ITL: 25.38 ms   Throughput: 315.19 tok/s
+===== PERF KVFP8 bs=8 in=4096 out=128 =====
+ Prefill TTFT: 6398.73 ms  Throughput: 5121.01 tok/s
+ Decode  Avg ITL: 34.87 ms   Throughput: 229.42 tok/s
+===== PERF KVBF16 bs=1 in=16384 out=128 =====
+ Prefill TTFT: 8519.46 ms  Throughput: 1923.13 tok/s
+ Decode  Avg ITL: 20.81 ms   Throughput: 48.05 tok/s
+===== PERF KVFP8 bs=1 in=16384 out=128 =====
+ Prefill TTFT: 8559.72 ms  Throughput: 1914.08 tok/s
+ Decode  Avg ITL: 64.72 ms   Throughput: 15.45 tok/s
+===== PERF KVBF16 bs=8 in=16384 out=128 =====
+===== PERF KVFP8 bs=8 in=16384 out=128 =====
+W6_PERF_BENCH_DONE

@@ -23,11 +23,33 @@ from datasets import load_dataset
 from tqdm import tqdm
 from transformers import AutoTokenizer
 
-from infinilm.cache import StaticKVCacheConfig
+from infinilm.cache import PagedKVCacheConfig, StaticKVCacheConfig
 from infinilm.distributed import DistConfig
 from infinilm.generation.utils import infini_to_numpy
 from infinilm.infer_engine import InferEngine
 from infinilm.modeling_utils import load_model_state_dict_by_file
+
+_PAGED_BLOCK = 256
+
+
+def make_cache_config(seqlen, kv_cache_dtype):
+    """kv_cache_dtype 为 None 时维持 static 行为;否则走 paged(FP8 KV 唯一支持的后端)。"""
+    if kv_cache_dtype is None:
+        return StaticKVCacheConfig(max_batch_size=1, max_cache_len=seqlen)
+    num_blocks = (seqlen + _PAGED_BLOCK - 1) // _PAGED_BLOCK + 8
+    return PagedKVCacheConfig(
+        num_blocks=num_blocks, block_size=_PAGED_BLOCK, max_batch_size=1
+    )
+
+
+def build_paged_meta(seq_len, kv_cache_dtype):
+    """单序列 prefill 的 paged 元数据(与 generate 路径相同的连续块约定)。"""
+    if kv_cache_dtype is None:
+        return None, None
+    n_blocks = (seq_len + _PAGED_BLOCK - 1) // _PAGED_BLOCK
+    block_tables = infinicore.from_list([list(range(n_blocks))], dtype=infinicore.int32)
+    slot_mapping = infinicore.from_list(list(range(seq_len)), dtype=infinicore.int64)
+    return block_tables, slot_mapping
 
 
 def logits_to_numpy_f32(t):
@@ -52,6 +74,11 @@ def main():
     ap.add_argument("--dataset", default="Salesforce/wikitext")
     ap.add_argument("--dataset-config", default="wikitext-2-raw-v1")
     ap.add_argument("--device", default="cuda")
+    ap.add_argument(
+        "--kv-cache-dtype",
+        default=None,
+        help="如 fp8:切 paged 后端并量化 KV cache;缺省保持 static BF16",
+    )
     args = ap.parse_args()
 
     device = infinicore.device(args.device, 0)
@@ -59,7 +86,9 @@ def main():
         args.model,
         device=device,
         distributed_config=DistConfig(1),
-        cache_config=StaticKVCacheConfig(max_batch_size=1, max_cache_len=args.chunk),
+        cache_config=make_cache_config(args.chunk, args.kv_cache_dtype),
+        attention_backend="paged-attn" if args.kv_cache_dtype else "default",
+        kv_cache_dtype=args.kv_cache_dtype,
     )
     load_model_state_dict_by_file(engine, args.model, dtype=engine.dtype)
 
@@ -83,10 +112,9 @@ def main():
             if args.max_chunks and n_chunks >= args.max_chunks:
                 break
 
-            engine.reset_cache(
-                StaticKVCacheConfig(max_batch_size=1, max_cache_len=len(chunk))
-            )
+            engine.reset_cache(make_cache_config(len(chunk), args.kv_cache_dtype))
             seq_len = len(chunk)
+            block_tables, slot_mapping = build_paged_meta(seq_len, args.kv_cache_dtype)
             ids = infinicore.from_list([chunk], dtype=infinicore.int64).to(device)
             pos = infinicore.from_list(
                 [list(range(seq_len))], dtype=infinicore.int64
@@ -102,6 +130,8 @@ def main():
                 total_kv_lengths=total_kv,
                 input_offsets=input_offsets,
                 cu_seqlens=cu_seqlens,
+                block_tables=block_tables,
+                slot_mapping=slot_mapping,
             )
             logits = out["logits"]
             logits_np = logits_to_numpy_f32(logits)  # [1, seq, vocab]
@@ -132,6 +162,7 @@ def main():
     ppl = math.exp(total_nll / total_tokens)
     result = {
         "model": args.model,
+        "kv_cache_dtype": args.kv_cache_dtype,
         "chunk": args.chunk,
         "chunks": n_chunks,
         "tokens": total_tokens,

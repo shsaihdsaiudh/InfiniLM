@@ -1,0 +1,43 @@
+===== RUN ppl_kvfp8_full 14:11:14 =====
+  "chunks": 2886,
+  "tokens": 293457,
+  "nll": 862089.0535273552,
+  "ppl": 18.87241716786544
+}
+PPL_SAVED /root/fp8/eval_logs/ppl_kvfp8_full.json
+===== RUN ppl_kvbf16_paged_full 14:18:18 =====
+  "chunks": 2886,
+  "tokens": 293457,
+  "nll": 862163.51587677,
+  "ppl": 18.87720649927123
+}
+PPL_SAVED /root/fp8/eval_logs/ppl_kvbf16_paged_full.json
+===== RUN ceval_kvfp8 14:25:16 =====
+{
+  "correct": 1000,
+  "total": 1346,
+  "accuracy": 0.7429420505200595
+}
+MCQ_SAVED /root/fp8/eval_logs/ceval_kvfp8.json (112s)
+===== RUN ceval_kvbf16_paged 14:27:17 =====
+{
+  "correct": 1005,
+  "total": 1346,
+  "accuracy": 0.7466567607726597
+}
+MCQ_SAVED /root/fp8/eval_logs/ceval_kvbf16_paged.json (103s)
+===== RUN mmlu_kvfp8 14:29:10 =====
+{
+  "correct": 9765,
+  "total": 14042,
+  "accuracy": 0.6954137587238285
+}
+MCQ_SAVED /root/fp8/eval_logs/mmlu_kvfp8.json (1277s)
+===== RUN mmlu_kvbf16_paged 14:50:37 =====
+{
+  "correct": 9734,
+  "total": 14042,
+  "accuracy": 0.6932060959977211
+}
+MCQ_SAVED /root/fp8/eval_logs/mmlu_kvbf16_paged.json (1166s)
+W6_ACCURACY_CHAIN_DONE
