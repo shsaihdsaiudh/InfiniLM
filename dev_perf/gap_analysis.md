@@ -1,6 +1,14 @@
 # 项目 #2 基线差距清单
 
-最新进展见 v16（2026-09-01）：投机采样方向开工并已在 5090 验收——
+最新进展见 v17（2026-09-02）：8B 量级通用化验证——Qwen3-8B bf16 在
+5090 32GB 上重跑 v16 全矩阵。结论：prompt-lookup 投机 + spec×chunked
+融合跨量级通用且收益放大（单请求 4.4×，反超 0.6B 的 2.3×；8B decode
+更彻底地 memory-bound，验证近零成本）；CUDA 图化收益归零（小模型专属
+优化）；发现门控在 8B 大 batch 下失真（w3 bs=32 慢 5% 未触发回退，
+tok/step 阈值不反映每步真实成本）。14B 档位被 FP8 权重路径缺失卡住
+（FP8 检查点加载即失败），未验证。
+
+v16（2026-09-01）：投机采样方向开工并已在 5090 验收——
 prompt-lookup（零训练、模型无关的 n-gram draft）+ spec×chunked 融合 +
 融合单前向（主采样与 draft 验证一次完成，纯 decode 批次形状固定
 b×(k+1)，为 verify 图化备好可录制形状）+ 自适应收益门控（低命中负载
@@ -10,6 +18,73 @@ w4/w5/w7 提速 2.1~2.4×、w6 吞吐 +57%、w1 打平，高命中负载输出�
 bug，详见 v16 验收结果节）。v15 的 kernel 级归因结论不变：小模型
 decode 的常数项（小 kernel 延迟 + 图外 CPU）决定了投机必须走融合
 单前向才有净收益。
+
+---
+
+## v17（2026-09-02）：8B 量级通用化验证 —— Qwen3-8B @ 5090 全矩阵
+
+动机：v16 全部结论在 0.6B 上验收，而 0.6B decode 的常数项（launch +
+图外 CPU）占步时近半，是瓶颈结构最极端的样本；消费卡真正有用户价值
+的主力档位是 8B（32GB 卡能舒服跑 bf16 的最大量级）。本轮用
+Qwen3-8B bf16 重跑四组矩阵（base / +graph / +prompt_lookup /
++graph+spec；--num-blocks 128，chunked prefill 全程自动开启，
+greedy + --dump-outputs），验证 v16 三项改动是否通用化。结果 JSON
+在 5090 VM 的 `dev_perf/results/8b_v16/`。
+
+### 性能（tok/s，5090 32GB，k=4）
+
+| workload | base | +graph | +spec | +graph+spec | spec 倍率 | accept | avg tok/step |
+|---|---|---|---|---|---|---|---|
+| w1_short_decode | 93.5 | 93.0 | **408** | 399 | **4.4×** | 1.000 | 4.57 |
+| w2_long_prefill | 57.8 | 57.6 | **115.3** | 114.3 | **2.0×** | 0.926 | 4.57 |
+| w3_batch32 | 2428 | 2418 | 2304 | 2285 | **-5%** ⚠ | 0.886 | 3.09 |
+| w4_long_decode | 90.2 | 89.7 | **190.3** | 187.9 | **2.1×** | 0.902 | 3.35 |
+| w5_concurrent_prefill | 171 | 168 | **213** | 213 | **+25%** | 0.926 | 4.57 |
+| w6_decode_stall | 535 | 530 | 546 | 545 | +2% | — | — |
+| w7_repetitive_copy | 90.4 | 89.8 | **197.5** | 198.6 | **2.2×** | 0.913 | 3.26 |
+
+### 结论
+
+1. **投机采样跨量级通用，且 8B 收益反超 0.6B。** 8B decode 一步
+   10.7ms ≈ 纯权重读取时间（16GB / ~1.5TB/s），是教科书级
+   memory-bound：验证 5 个 token 与跑 1 个成本几乎相同（w1 spec
+   每步 11.2ms vs base 10.7ms），加速比 ≈ avg tok/step。单请求
+   4.4×（0.6B 为 2.3×）；接受率 w1 100% / w4 90% / w7 91%。
+2. **spec×chunked 融合通用**：w5 混排批次（8 长 prompt 并发）+25%，
+   无异常、输出正确（逐请求相位判定在真实混排下工作正常）。
+3. **CUDA 图化收益在 8B 归零**（±0.5% 噪声内）：步时 10.7ms 下
+   launch/CPU 常数项可忽略。图化是小模型专属优化，8B 不必开。
+4. **门控在 8B 大 batch 下失真（本轮最重要的新发现）**：w3 bs=32
+   开 spec 慢 5%，但门控未回退——它只看 avg tok/step（3.09 > 阈值
+   2.0），而 bs=32 时验证前向每步 32×5=160 token 已偏离
+   memory-bound，每步真实成本显著上涨。v16 的 2.0 阈值是按 0.6B
+   标定的（eager 投机步 ≈ 2× 图化步），在大模型大 batch 下
+   tok/step 不再等价于盈亏平衡。后续应改为按每步实测耗时对比
+   （或 batch 加权的成本模型）做门控。
+5. **正确性与 v16 同结论**：w1/w2/w5/w7 四组配置输出逐 token
+   完全一致；w3（26/32）、w4（token 81 分歧）、w6 有分歧，但
+   spec 与 graph+spec 的分歧点完全相同、且纯 graph（无 spec）也在
+   w3 翻了 1 个请求——仍是 verify 与 decode 批次形状不同导致的
+   near-tie argmax 数值翻转，非投机逻辑 bug。
+
+### 14B 档位：未验证（两个硬障碍）
+
+- Qwen3-14B-FP8 初始化即 OOM：FP8 检查点上采样为 bf16 ≈ 28GB，
+  加 KV 后超 32GB 显存；
+- Qwen3-8B-FP8 直接 state_dict 加载报错——**FP8 权重路径在当前
+  checkout 上是断的**（`modeling_utils.py` 只有 F8 dtype 映射，
+  无反量化/scales 处理）。
+
+要在 14B 档位（32GB 卡上的任何 >8B 模型）验证，前置是打通
+FP8/INT4 权重路径——这同时也是"消费卡跑 14B"产品故事本身的前置。
+
+### 环境注记（8B @ 32GB 卡复现）
+
+- `--num-blocks` 必须 ≤128：256 时加载后即占 29.4GB/32.6GB，
+  w2/w3 的激活内存会把显存顶爆（Error Code 2 cudaMalloc）。
+- bench.py 运行需显式 `HF_HOME=/data/huggingface_home`（nohup
+  等非交互 shell 不继承交互环境变量，否则 HF_HUB_OFFLINE=1 下
+  找不到本地快照）。
 
 ---
 
