@@ -6,7 +6,11 @@
 更彻底地 memory-bound，验证近零成本）；CUDA 图化收益归零（小模型专属
 优化）；发现门控在 8B 大 batch 下失真（w3 bs=32 慢 5% 未触发回退，
 tok/step 阈值不反映每步真实成本）。14B 档位被 FP8 权重路径缺失卡住
-（FP8 检查点加载即失败），未验证。
+（FP8 检查点加载即失败），未验证。对 vLLM 0.28 的 8B 对照（09-03）：
+开投机后单请求/延迟敏感负载全面碾压 vLLM（w1 4.2×、w4/w7 约 2×、
+w2 +41%），大 batch 吞吐与并发 prefill 仍输（w3 -16%、w5 -27%）——
+InfiniLM 的战场边界：单卡个人用户，不是多并发 serving。注意 vLLM
+侧未开它自己的 ngram 投机（补 vLLM+ngram 对照是后续项）。
 
 v16（2026-09-01）：投机采样方向开工并已在 5090 验收——
 prompt-lookup（零训练、模型无关的 n-gram draft）+ spec×chunked 融合 +
@@ -66,6 +70,43 @@ greedy + --dump-outputs），验证 v16 三项改动是否通用化。结果 JSO
    spec 与 graph+spec 的分歧点完全相同、且纯 graph（无 spec）也在
    w3 翻了 1 个请求——仍是 verify 与 decode 批次形状不同导致的
    near-tie argmax 数值翻转，非投机逻辑 bug。
+
+### 对 vLLM 0.28 的 8B 对照（2026-09-03）
+
+同一台 5090、同一负载矩阵跑 vLLM 0.28（v1 默认：CUDA graph +
+prefix caching 开；greedy；--dump-outputs）。**口径注意：vLLM 未开
+它自己的 ngram 投机**（bench.py 的 vllm 路径尚不支持传 spec 配置，
+补一轮 vLLM+ngram 是后续项）；w6 因 vLLM 不暴露 raw llm handle
+跳过（与 v10 口径相同）。
+
+| workload | vLLM 0.28 | InfiniLM base | InfiniLM+spec | spec vs vLLM |
+|---|---|---|---|---|
+| w1_short_decode | 98.2 | 93.5 | **408** | **赢 4.2×** |
+| w2_long_prefill | 81.8 | 57.8 | **115.3** | **赢 +41%** |
+| w3_batch32 | **2730** | 2428 | 2304 | 输 -16% |
+| w4_long_decode | 98.3 | 90.2 | **190.3** | **赢 +94%** |
+| w5_concurrent_prefill | **292** | 171 | 213 | 输 -27% |
+| w7_repetitive_copy | 98.1 | 90.4 | **197.5** | **赢 +101%** |
+
+跨引擎对拍：w1/w2/w5 逐 token 完全一致；w3（24/32）/w4/w6 分歧为
+near-tie argmax 翻转（跨引擎数值差异的正常表现）。
+
+解读：
+
+- **单请求/延迟敏感场景（消费卡主力用法）InfiniLM+spec 全面碾压
+  vLLM**（2~4× 量级）——"消费卡单用户"叙事成立的核心证据。
+- **吞吐/serving 场景仍输 vLLM**（w3 -16%、w5 -27%）：大 batch
+  计算效率与 prefill 调度是 vLLM 的成熟区，InfiniLM 的边界在
+  单卡个人用户，不在多并发 serving。
+- base 对 vLLM 全面小输（-5%~-41%）：8B 上的反超全部来自 v16 的
+  投机链路，没有投机本引擎在 8B 没有竞争力。
+
+vLLM 环境注记（sm_120/5090 + torch 2.13 + CUDA 12.8，固化在远端
+`run_vllm_8b.sh`）：需 `VLLM_ATTENTION_BACKEND=FLASH_ATTN`（默认
+flashinfer 后端的 arch 检测不认识 sm_120）、
+`FLASHINFER_CUDA_ARCH_LIST="12.0f"`（绕过 _normalize_cuda_arch 的
+CUDA>=12.9 检查）、`VLLM_USE_FLASHINFER_SAMPLER=0`（采样算子 JIT
+需 CUDA 12.9 编 120f cubin，本机 toolkit 是 12.8）。
 
 ### 14B 档位：未验证（两个硬障碍）
 
