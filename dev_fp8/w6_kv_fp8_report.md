@@ -89,4 +89,4 @@ cursor + loadToken 解耦,warp 数常量可调)。
 - FLASH_ATTN/STATIC 后端、MLA(576/512)、videonsa/deepseek 自定义分配路径暂不支持 FP8 KV
   (显式报错或 info 校验拦截)。
 - KV connector(PD 分离)不传输 scale,该组合不可用。
-- 其他 vendor(ascend/bang/metax/moore)的 paged 算子 create 签名未跟进(C API 已扩展),需各自补两个透传参数。
+- 其他 vendor(ascend/bang/metax/moore)的 paged 算子签名已补齐透传参数(W7,2026-09-03;F8 cache 在这些后端显式返回 NOT_IMPLEMENTED,FP8 KV 仍仅 nvidia 支持)。
