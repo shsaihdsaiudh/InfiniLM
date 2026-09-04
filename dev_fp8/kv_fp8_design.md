@@ -34,6 +34,7 @@
      clean-room 实现在线 softmax decode kernel：CTA per (seq, q_head)，128 线程，
      沿 block_tables 遍历 token，K/V 加载点做 dequant-on-load（decode→乘 scale→转累算 dtype）。
      v1 不做 split-kv（Qwen3-8B 32 q head → 32 CTA；长上下文 bs=1 的 SM 占用不足记入报告）。
+     （v2 已加跨 CTA split-kv + combine 归约 pass，见 `w7_kv_fp8_splitkv_report.md`。）
    - **paged_attention_prefill**：优先方案 A——读 `kernel_v2.cuh` 的 K/V 加载点，
      若加载足够隔离则加 dtype 模板参数做 dequant-on-load（允许适度修改 prefill kernel，
      但必须保持 F16/BF16 路径逐位不变）；若加载点太分散则用方案 B——op 内部按 block_tables
@@ -101,5 +102,6 @@ shape `[num_blocks, num_kv_heads, block_size]`；cache dtype!=F8 时必须为 nu
 ## 风险
 
 - decode 无 split-kv：bs=1 长上下文 SM 占用低，性能数据如实记录，必要时 v2 加 split-kv。
+  （已在 v2 落地：token 维分shard多 CTA + log2域 combine kernel，auto 启发式默认开启。）
 - prefill 方案 B 有额外 scratch 显存与流量（prefill 一次性、计算bound，可接受）。
 - E4M3 无 inf，amax 异常（NaN 输入）时行为与 encode 一致截断，不做特殊处理。
