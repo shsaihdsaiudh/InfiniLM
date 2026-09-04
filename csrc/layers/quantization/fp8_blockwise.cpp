@@ -81,14 +81,16 @@ infinicore::Tensor FP8Blockwise::forward(
 
     // Fused path (decode): the fp8_blockwise_gemm kernel reads every FP8
     // weight byte exactly once and dequantizes in registers, avoiding the
-    // materialized BF16 weight of the naive path. Measured on RTX 5090
-    // (Qwen3-8B-FP8): the fused kernel wins for M <= 8 (bs=1: 141 vs 28
-    // tok/s; bs=8: 412 vs 218) and loses from M >= 16 (bs=16: 382 vs 427),
-    // where the cuBLAS-backed naive path keeps the traffic advantage of one
-    // dequantized weight read per 16 rows. Large-M (prefill) also stays on
-    // the naive path, and the fused kernel currently implements alpha == 1
-    // only. Set INFINILM_FP8_FUSED_GEMM=0 to force the naive path (A/B
-    // testing).
+    // materialized BF16 weight of the naive path. The operator dispatches
+    // internally: SIMT warp-per-row for M <= 8 (measured on RTX 5090,
+    // Qwen3-8B-FP8: bs=1 141 vs 28 tok/s, bs=8 412 vs 218 against naive),
+    // a tensor-core mma.m16n8k16 kernel for 9 <= M <= 32 with F16/BF16
+    // activations (the SIMT M_TILE kernels go instruction-throughput bound
+    // there; INFINIOP_FP8_GEMM_MMA=0 forces SIMT for A/B). M > 32 (prefill)
+    // stays on the naive cuBLAS path, as does any M with F32 activations
+    // (SIMT M_TILE fallback inside the operator). The fused kernel
+    // implements alpha == 1 only. Set INFINILM_FP8_FUSED_GEMM=0 to force
+    // the naive path (A/B testing).
     static const bool fused_gemm_enabled = [] {
         const char *env = std::getenv("INFINILM_FP8_FUSED_GEMM");
         return env == nullptr || env[0] != '0';
@@ -96,7 +98,7 @@ infinicore::Tensor FP8Blockwise::forward(
     const auto &weight = params.at("weight");
     const size_t k = weight->size(1);
     const size_t m = input_contiguous->numel() / k;
-    if (fused_gemm_enabled && alpha == 1.0f && m <= 8
+    if (fused_gemm_enabled && alpha == 1.0f && m <= 32
         && input->device().getType() == infinicore::Device::Type::NVIDIA
         && block_m_ % 16 == 0 && block_n_ % 128 == 0 && k % 128 == 0) {
         auto flat_input = input_contiguous->view({m, k});
