@@ -1,0 +1,187 @@
+AWQ Marlin kernels generated successfully!
+[0m[38;5;2;1m[ 31%]:[0m [38;5;5;1m<infiniop-nvidia>[0m compiling.release src/infiniop/ops/add/nvidia/add_nvidia.cu[0m
+[0m[38;5;2;1m[ 31%]:[0m [38;5;5;1m<infiniop-nvidia>[0m compiling.release src/infiniop/ops/add_rms_norm/nvidia/add_rms_norm_nvidia.cu[0m
+[0m[38;5;2;1m[ 32%]:[0m [38;5;5;1m<infiniop-nvidia>[0m compiling.release src/infiniop/ops/awq_marlin_gemm/nvidia/awq_marlin_gemm_nvidia.cu[0m
+[0m[38;5;2;1m[ 32%]:[0m [38;5;5;1m<infiniop-nvidia>[0m compiling.release src/infiniop/ops/awq_marlin_gemm/nvidia/sm80_kernel_bfloat16_fe2m1f_bfloat16.cu[0m
+[0m[38;5;2;1m[ 32%]:[0m [38;5;5;1m<infiniop-nvidia>[0m compiling.release src/infiniop/ops/awq_marlin_gemm/nvidia/sm80_kernel_bfloat16_fe4m3fn_bfloat16.cu[0m
+[0m[38;5;2;1m[ 32%]:[0m [38;5;5;1m<infiniop-nvidia>[0m compiling.release src/infiniop/ops/awq_marlin_gemm/nvidia/sm80_kernel_bfloat16_u4_bfloat16.cu[0m
+[0m[38;5;2;1m[ 32%]:[0m [38;5;5;1m<infiniop-nvidia>[0m compiling.release src/infiniop/ops/awq_marlin_gemm/nvidia/sm80_kernel_bfloat16_u4b8_bfloat16.cu[0m
+[0m[38;5;2;1m[ 32%]:[0m [38;5;5;1m<infiniop-nvidia>[0m compiling.release src/infiniop/ops/awq_marlin_gemm/nvidia/sm80_kernel_bfloat16_u8b128_bfloat16.cu[0m
+[0m[38;5;2;1m[ 32%]:[0m [38;5;5;1m<infiniop-nvidia>[0m compiling.release src/infiniop/ops/awq_marlin_gemm/nvidia/sm80_kernel_float16_fe2m1f_float16.cu[0m
+[0m[38;5;2;1m[ 32%]:[0m [38;5;5;1m<infiniop-nvidia>[0m compiling.release src/infiniop/ops/awq_marlin_gemm/nvidia/sm80_kernel_float16_fe4m3fn_float16.cu[0m
+[0m[38;5;2;1m[ 32%]:[0m [38;5;5;1m<infiniop-nvidia>[0m compiling.release src/infiniop/ops/awq_marlin_gemm/nvidia/sm80_kernel_float16_u4_float16.cu[0m
+[0m[38;5;2;1m[ 32%]:[0m [38;5;5;1m<infiniop-nvidia>[0m compiling.release src/infiniop/ops/awq_marlin_gemm/nvidia/sm80_kernel_float16_u4b8_float16.cu[0m
+[0m[38;5;2;1m[ 32%]:[0m [38;5;5;1m<infiniop-nvidia>[0m compiling.release src/infiniop/ops/awq_marlin_gemm/nvidia/sm80_kernel_float16_u8b128_float16.cu[0m
+[0m[38;5;2;1m[ 32%]:[0m [38;5;5;1m<infiniop-nvidia>[0m compiling.release src/infiniop/ops/awq_marlin_gemm/nvidia/sm80_kernel_s8_u4_bfloat16.cu[0m
+[0m[38;5;2;1m[ 32%]:[0m [38;5;5;1m<infiniop-nvidia>[0m compiling.release src/infiniop/ops/awq_marlin_gemm/nvidia/sm80_kernel_s8_u4_float16.cu[0m
+[0m[38;5;2;1m[ 32%]:[0m [38;5;5;1m<infiniop-nvidia>[0m compiling.release src/infiniop/ops/awq_marlin_gemm/nvidia/sm80_kernel_s8_u4b8_bfloat16.cu[0m
+[0m[38;5;2;1m[ 42%]:[0m [38;5;5;1m<infiniop-nvidia>[0m compiling.release src/infiniop/ops/paged_attention/nvidia/paged_attention_nvidia.cu[0m
+[0m[38;5;2;1m[ 42%]:[0m [38;5;5;1m<infiniop-nvidia>[0m compiling.release src/infiniop/ops/paged_attention/nvidia/paged_attention_fp8.cu[0m
+[0m[38;5;2;1m[ 47%]:[0m [38;5;5;1m<infiniop-nvidia>[0m compiling.release src/infiniop/ops/fp8_blockwise_gemm/nvidia/fp8_blockwise_gemm_nvidia.cu[0m
+[0m[38;5;2;1m[ 93%]:[0m [38;5;5;1m<infiniop-nvidia>[0m [38;5;5;1mdevlinking.release infiniop-nvidia_gpucode.cu.o[0m
+[0m[38;5;2;1m[ 94%]:[0m [38;5;5;1m<infiniop-nvidia>[0m [38;5;5;1marchiving.release libinfiniop-nvidia.a[0m
+[0m[38;5;2;1m[ 94%]:[0m [38;5;5;1m<infiniop>[0m [38;5;5;1mlinking.release libinfiniop.so[0m
+[0m[38;5;2;1m[ 94%]:[0m [38;5;5;1m<infinicore_cpp_api>[0m [38;5;5;1mlinking.release libinfinicore_cpp_api.so[0m
+[1;33m[Congratulations!] Now you can install the libraries with "xmake install"[0m
+[1;33m[Congratulations!] Now you can install the libraries with "xmake install"[0m
+[0m[38;5;2;1m[100%]:[0m [38;5;2;1mbuild ok, spent 47.735s[0m
+[0m[1;38;5;3;1mwarning: [38;5;3;1mdeprecated: please use add_rules("python.module") instead of add_rules("python.library")[0m
+[0m[1;38;5;3;1mwarning: [38;5;3;1madd -v for getting more warnings ..[0m
+AWQ Marlin kernels generated successfully!
+installing infinirt ..
+installing infinirt to /root/fp8/.infini ..
+installing infiniop ..
+installing infiniop to /root/fp8/.infini ..
+installing infiniccl ..
+installing infiniccl to /root/fp8/.infini ..
+installing infinicore_cpp_api ..
+installing infinicore_cpp_api to /root/fp8/.infini ..
+installing infinicore_c_api ..
+installing infinicore_c_api to /root/fp8/.infini ..
+installing infiniutils-test ..
+installing infiniutils-test to /root/fp8/.infini ..
+[0m[38;5;2;1minstall ok![0m
+[0m[1;38;5;3;1mwarning: [38;5;3;1mdeprecated: please use add_rules("python.module") instead of add_rules("python.library")[0m
+CORE_BUILD_DONE
+AWQ Marlin kernels generated successfully!
+[1;33m[Congratulations!] Now you can install the libraries with "xmake install"[0m
+[0m[38;5;2;1m[ 94%]:[0m [38;5;5;1m<_infinicore>[0m [38;5;5;1mlinking.release _infinicore.cpython-312-x86_64-linux-gnu.so[0m
+[0m[38;5;2;1m[100%]:[0m [38;5;2;1mbuild ok, spent 1.02s[0m
+[0m[1;38;5;3;1mwarning: [38;5;3;1mdeprecated: please use add_rules("python.module") instead of add_rules("python.library")[0m
+AWQ Marlin kernels generated successfully!
+installing _infinicore ..
+installing _infinicore to python/infinicore ..
+[0m[38;5;2;1minstall ok![0m
+[0m[1;38;5;3;1mwarning: [38;5;3;1mdeprecated: please use add_rules("python.module") instead of add_rules("python.library")[0m
+[0m[1;38;5;3;1mwarning: [38;5;3;1madd -v for getting more warnings ..[0m
+[0m[38;5;2;1m[  0%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/cache/kv_cache.cpp[0m
+[0m[38;5;2;1m[  0%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/cache/mamba_cache.cpp[0m
+[0m[38;5;2;1m[  0%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/config/config_factory.cpp[0m
+[0m[38;5;2;1m[  0%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/config/model_config.cpp[0m
+[0m[38;5;2;1m[  0%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/config/quant_config.cpp[0m
+[0m[38;5;2;1m[  0%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/debug_utils/hooks.cpp[0m
+[0m[38;5;2;1m[  0%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/engine/compiler/general_compiler.cpp[0m
+[0m[38;5;2;1m[  0%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/engine/compiler/paged_compiler.cpp[0m
+[0m[38;5;2;1m[  0%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/engine/compiler/static_batching_compiler.cpp[0m
+[0m[38;5;2;1m[  0%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/engine/distributed/communication_group.cpp[0m
+[0m[38;5;2;1m[  2%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/engine/infer_engine.cpp[0m
+[0m[38;5;2;1m[  2%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/engine/rank_worker.cpp[0m
+[0m[38;5;2;1m[  2%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/global_state/global_state.cpp[0m
+[0m[38;5;2;1m[  2%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/layers/attention/attention.cpp[0m
+[0m[38;5;2;1m[  2%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/layers/attention/backends/attention_layer.cpp[0m
+[0m[38;5;2;1m[  2%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/layers/attention/backends/flash_attn.cpp[0m
+[0m[38;5;2;1m[  2%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/layers/attention/backends/paged_attn.cpp[0m
+[0m[38;5;2;1m[  2%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/layers/attention/backends/static_attn.cpp[0m
+[0m[38;5;2;1m[  2%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/layers/linear/base_linear.cpp[0m
+[0m[38;5;2;1m[  2%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/layers/linear/fused_linear.cpp[0m
+[0m[38;5;2;1m[  2%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/layers/linear/linear.cpp[0m
+[0m[38;5;2;1m[  2%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/layers/mlp/mlp.cpp[0m
+[0m[38;5;2;1m[  2%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/layers/moe/dispatcher/dispatcher_factory.cpp[0m
+[0m[38;5;2;1m[  2%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/layers/moe/dispatcher/standard_dispatcher.cpp[0m
+[0m[38;5;2;1m[  2%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/layers/moe/ep/allgather_reduce_scatter_dispatcher.cpp[0m
+[0m[38;5;2;1m[  2%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/layers/moe/ep/base_ep_dispatcher.cpp[0m
+[0m[38;5;2;1m[  2%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/layers/moe/ep/deepep_dispatcher.cpp[0m
+[0m[38;5;2;1m[  2%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/layers/moe/ep/ep_config.cpp[0m
+[0m[38;5;2;1m[  2%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/layers/moe/ep/local_allreduce_dispatcher.cpp[0m
+[0m[38;5;2;1m[  2%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/layers/moe/experts/fused_moe_experts.cpp[0m
+[0m[38;5;2;1m[  2%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/layers/moe/fused_moe.cpp[0m
+[0m[38;5;2;1m[  2%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/layers/moe/legacy/moe_mlp.cpp[0m
+[0m[38;5;2;1m[  3%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/layers/moe/router/topk_router.cpp[0m
+[0m[38;5;2;1m[  4%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/layers/moe/runner/cuda_fused_moe_runner.cpp[0m
+[0m[38;5;2;1m[  5%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/layers/moe/sparse_moe_block.cpp[0m
+[0m[38;5;2;1m[  5%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/layers/quantization/awq.cpp[0m
+[0m[38;5;2;1m[  6%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/layers/quantization/awq_marlin.cpp[0m
+[0m[38;5;2;1m[  7%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/layers/quantization/base_quantization.cpp[0m
+[0m[38;5;2;1m[  7%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/layers/quantization/compressed_tensors.cpp[0m
+[0m[38;5;2;1m[  8%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/layers/quantization/fp8_blockwise.cpp[0m
+[0m[38;5;2;1m[  9%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/layers/quantization/gptq.cpp[0m
+[0m[38;5;2;1m[ 10%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/layers/quantization/gptq_marlin.cpp[0m
+[0m[38;5;2;1m[ 10%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/layers/quantization/gptq_qy.cpp[0m
+[0m[38;5;2;1m[ 11%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/layers/quantization/kv_quant.cpp[0m
+[0m[38;5;2;1m[ 12%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/layers/quantization/marlin_utils.cpp[0m
+[0m[38;5;2;1m[ 13%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/layers/quantization/mxfp4.cpp[0m
+[0m[38;5;2;1m[ 13%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/layers/quantization/none_quantization.cpp[0m
+[0m[38;5;2;1m[ 14%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/layers/rotary_embedding/rope_scaling_creators.cpp[0m
+[0m[38;5;2;1m[ 15%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/layers/rotary_embedding/rotary_embedding.cpp[0m
+[0m[38;5;2;1m[ 15%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/layers/rotary_embedding/rotary_embedding_factory.cpp[0m
+[0m[38;5;2;1m[ 16%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/models/baichuan/baichuan_for_causal_lm.cpp[0m
+[0m[38;5;2;1m[ 17%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/models/chatglm/chatglm_for_causal_lm.cpp[0m
+[0m[38;5;2;1m[ 18%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/models/deepseek/deepseek_decoder_layer.cpp[0m
+[0m[38;5;2;1m[ 18%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/models/deepseek/deepseek_for_causal_lm.cpp[0m
+[0m[38;5;2;1m[ 19%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/models/deepseek_v2/deepseek_v2_allocate_kv_cache_tensors.cpp[0m
+[0m[38;5;2;1m[ 20%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/models/deepseek_v2/deepseek_v2_attention.cpp[0m
+[0m[38;5;2;1m[ 21%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/models/deepseek_v2/deepseek_v2_decoder_layer.cpp[0m
+[0m[38;5;2;1m[ 21%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/models/deepseek_v2/deepseek_v2_for_causal_lm.cpp[0m
+[0m[38;5;2;1m[ 22%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/models/deepseek_v2/deepseek_v2_mla_attention.cpp[0m
+[0m[38;5;2;1m[ 23%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/models/deepseek_v2/deepseek_v2_moe.cpp[0m
+[0m[38;5;2;1m[ 23%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/models/ernie4_5_vl/ernie4_5_attention.cpp[0m
+[0m[38;5;2;1m[ 24%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/models/ernie4_5_vl/ernie4_5_decoder_layer.cpp[0m
+[0m[38;5;2;1m[ 25%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/models/ernie4_5_vl/ernie4_5_for_causal_lm.cpp[0m
+[0m[38;5;2;1m[ 26%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/models/ernie4_5_vl/ernie4_5_model.cpp[0m
+[0m[38;5;2;1m[ 26%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/models/ernie4_5_vl/ernie4_5_moe.cpp[0m
+[0m[38;5;2;1m[ 27%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/models/ernie4_5_vl/ernie4_5_vision.cpp[0m
+[0m[38;5;2;1m[ 28%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/models/fm9g/fm9g_for_causal_lm.cpp[0m
+[0m[38;5;2;1m[ 29%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/models/glm4/glm4_decoder_layer.cpp[0m
+[0m[38;5;2;1m[ 29%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/models/glm4/glm4_for_causal_lm.cpp[0m
+[0m[38;5;2;1m[ 30%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/models/gpt2/gpt2_for_causal_lm.cpp[0m
+[0m[38;5;2;1m[ 31%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/models/infinilm_model.cpp[0m
+[0m[38;5;2;1m[ 31%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/models/internlm3/internlm3_for_causal_lm.cpp[0m
+[0m[38;5;2;1m[ 32%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/models/kimi_k25/kimi_k25_attention.cpp[0m
+[0m[38;5;2;1m[ 33%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/models/kimi_k25/kimi_k25_decoder_layer.cpp[0m
+[0m[38;5;2;1m[ 34%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/models/kimi_k25/kimi_k25_for_conditional_generation.cpp[0m
+[0m[38;5;2;1m[ 34%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/models/kimi_k25/kimi_k25_moe.cpp[0m
+[0m[38;5;2;1m[ 35%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/models/kimi_k25/kimi_k25_vision.cpp[0m
+[0m[38;5;2;1m[ 36%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/models/kimi_k3/kimi_k3_allocate_cache.cpp[0m
+[0m[38;5;2;1m[ 36%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/models/kimi_k3/kimi_k3_decoder_layer.cpp[0m
+[0m[38;5;2;1m[ 37%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/models/kimi_k3/kimi_k3_delta_attention.cpp[0m
+[0m[38;5;2;1m[ 38%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/models/kimi_k3/kimi_k3_for_conditional_generation.cpp[0m
+[0m[38;5;2;1m[ 39%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/models/kimi_k3/kimi_k3_mla_attention.cpp[0m
+[0m[38;5;2;1m[ 39%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/models/kimi_k3/kimi_k3_moe.cpp[0m
+[0m[38;5;2;1m[ 40%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/models/kimi_k3/kimi_k3_text_model.cpp[0m
+[0m[38;5;2;1m[ 41%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/models/kimi_k3/kimi_k3_vision.cpp[0m
+[0m[38;5;2;1m[ 42%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/models/llama/llama_for_causal_lm.cpp[0m
+[0m[38;5;2;1m[ 42%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/models/mamba/mamba_for_causal_lm.cpp[0m
+[0m[38;5;2;1m[ 43%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/models/minicpm4/minicpm4_for_causal_lm.cpp[0m
+[0m[38;5;2;1m[ 44%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/models/minicpm_eagle/minicpm_eagle_for_causal_lm.cpp[0m
+[0m[38;5;2;1m[ 44%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/models/minicpm_sala/minicpm_sala_allocate_kv_cache_tensors.cpp[0m
+[0m[38;5;2;1m[ 45%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/models/minicpm_sala/minicpm_sala_attention.cpp[0m
+[0m[38;5;2;1m[ 46%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/models/minicpm_sala/minicpm_sala_decoderLayer.cpp[0m
+[0m[38;5;2;1m[ 47%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/models/minicpm_sala/minicpm_sala_for_causal_lm.cpp[0m
+[0m[38;5;2;1m[ 47%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/models/minicpmv/minicpmv_model.cpp[0m
+[0m[38;5;2;1m[ 48%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/models/minicpmv/resampler.cpp[0m
+[0m[38;5;2;1m[ 49%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/models/minicpmv/siglip_vision.cpp[0m
+[0m[38;5;2;1m[ 50%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/models/mistral/mistral_for_causal_lm.cpp[0m
+[0m[38;5;2;1m[ 50%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/models/model_factory.cpp[0m
+[0m[38;5;2;1m[ 51%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/models/models_registry.cpp[0m
+[0m[38;5;2;1m[ 52%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/models/qwen2/qwen2_for_causal_lm.cpp[0m
+[0m[38;5;2;1m[ 52%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/models/qwen3/qwen3_attention.cpp[0m
+[0m[38;5;2;1m[ 53%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/models/qwen3/qwen3_for_causal_lm.cpp[0m
+[0m[38;5;2;1m[ 54%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/models/qwen3_5/qwen3_5_attention.cpp[0m
+[0m[38;5;2;1m[ 55%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/models/qwen3_5/qwen3_5_decoderLayer.cpp[0m
+[0m[38;5;2;1m[ 55%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/models/qwen3_5/qwen3_5_for_causal_lm.cpp[0m
+[0m[38;5;2;1m[ 56%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/models/qwen3_5/qwen3_5_fused_qkv_linear.cpp[0m
+[0m[38;5;2;1m[ 57%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/models/qwen3_5/qwen3_5_model.cpp[0m
+[0m[38;5;2;1m[ 58%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/models/qwen3_5/qwen3_5_vision.cpp[0m
+[0m[38;5;2;1m[ 58%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/models/qwen3_5_moe/qwen3_5_moe_decoder_layer.cpp[0m
+[0m[38;5;2;1m[ 59%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/models/qwen3_5_moe/qwen3_5_moe_for_causal_lm.cpp[0m
+[0m[38;5;2;1m[ 60%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/models/qwen3_moe/qwen3_moe_experts.cpp[0m
+[0m[38;5;2;1m[ 60%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/models/qwen3_moe/qwen3_moe_for_causal_lm.cpp[0m
+[0m[38;5;2;1m[ 61%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/models/qwen3_moe/qwen3_moe_sparse_moe_block.cpp[0m
+[0m[38;5;2;1m[ 62%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/models/qwen3_moe/qwen3_moe_topk_router.cpp[0m
+[0m[38;5;2;1m[ 63%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/models/qwen3_next/qwen3_next_allocate_kv_cache_tensors.cpp[0m
+[0m[38;5;2;1m[ 63%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/models/qwen3_next/qwen3_next_attention.cpp[0m
+[0m[38;5;2;1m[ 64%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/models/qwen3_next/qwen3_next_decoderLayer.cpp[0m
+[0m[38;5;2;1m[ 65%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/models/qwen3_next/qwen3_next_for_causal_lm.cpp[0m
+[0m[38;5;2;1m[ 65%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/models/qwen3_next/qwen3_next_gated_deltanet.cpp[0m
+[0m[38;5;2;1m[ 66%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/models/qwen3_next/qwen3_next_sparse_moe_block.cpp[0m
+[0m[38;5;2;1m[ 67%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/models/qwen3_vl/qwen3_vl_for_conditional_generation.cpp[0m
+[0m[38;5;2;1m[ 68%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/models/videonsa/videonsa_attention.cpp[0m
+[0m[38;5;2;1m[ 68%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/models/videonsa/videonsa_for_conditional_generation.cpp[0m
+[0m[38;5;2;1m[ 69%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/models/videonsa/videonsa_vision.cpp[0m
+[0m[38;5;2;1m[ 70%]:[0m [38;5;5;1m<_infinilm>[0m cache compiling.release csrc/pybind11/bindings.cc[0m
+[0m[38;5;2;1m[ 93%]:[0m [38;5;5;1m<_infinilm>[0m [38;5;5;1mlinking.release _infinilm.cpython-312-x86_64-linux-gnu.so[0m
+[0m[38;5;2;1m[100%]:[0m [38;5;2;1mbuild ok, spent 10.037s[0m
+installing _infinilm ..
+installing _infinilm to python/infinilm ..
+[0m[38;5;2;1minstall ok![0m
+LM_BUILD_DONE

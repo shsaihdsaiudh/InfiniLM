@@ -1,0 +1,29 @@
+=== MMA bs16 ===
+Auto-detected device platform: nvidia
+MoE EP backend: disabled  TP=1  DP=1  EP=1
+ load weights ......
+Found index file: /data/huggingface_home/hub/models--Qwen--Qwen3-8B-FP8/snapshots/220b46e3b2180893580a4454f21f22d3ebb187d3/model.safetensors.index.json. Loading shards by index.
+ load weights over! 2444.328546524048 ms 
+=================== start generate ====================
+ Generation completed in 1368.15 ms
+ Batchsize=16  Per_Batch_Input_Len=128  Per_Batch_New_Tokens=48
+ Prefill TTFT: 959.91 ms  Throughput: 2133.54 tok/s
+ Decode  Avg ITL: 8.69 ms   Throughput: 1842.06 tok/s
+<think>
+好的，用户提供的关于泰山的信息非常详细，包括别名、地理位置、面积、主峰高度以及其文化地位。首先，我需要确认用户的需求是什么。看起来用户可能是在准备关于泰山的介绍，或者
+total_time: 1368.36 ms
+=== NAIVE bs16 ===
+Auto-detected device platform: nvidia
+MoE EP backend: disabled  TP=1  DP=1  EP=1
+ load weights ......
+Found index file: /data/huggingface_home/hub/models--Qwen--Qwen3-8B-FP8/snapshots/220b46e3b2180893580a4454f21f22d3ebb187d3/model.safetensors.index.json. Loading shards by index.
+ load weights over! 2464.6458625793457 ms 
+=================== start generate ====================
+ Generation completed in 2724.54 ms
+ Batchsize=16  Per_Batch_Input_Len=128  Per_Batch_New_Tokens=48
+ Prefill TTFT: 970.84 ms  Throughput: 2109.52 tok/s
+ Decode  Avg ITL: 37.31 ms   Throughput: 428.81 tok/s
+<think>
+好的，用户提供的关于泰山的信息非常详细，包括别名、地理位置、面积、主峰高度以及其文化地位。我需要先确认这些信息的准确性，比如泰山的别名是否正确，主峰玉
+total_time: 2724.82 ms
+W8_SMOKE2_DONE

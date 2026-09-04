@@ -1,7 +1,10 @@
 # W8: FP8 decode GEMM 的 M_TILE tensor-core 化(9 ≤ M ≤ 32)
 
-> 状态:**代码与 CPU 模拟验证已完成,未经 GPU 构建/实测**(服务器不可用期间开发)。
-> 所有"预期"数字均为推断,待服务器验证后回填。验证清单见文末。
+> 状态:**GPU 实测验证通过(2026-09-04,RTX 5090 / CUDA 12.8)**。
+> 构建期修复一处编译错误:`launch_mtile` 提取为函数时模板参数 `int M_TILE` 被漏掉
+> (调用点均为两参形式,InfiniCore-fp8 工作树已修,待提交)。
+> 算子对拍 21/21 通过;decode bs=16 吞吐 1794.6 tok/s = SIMT 的 **4.73×**、naive 的 **4.20×**;
+> bs=32 2702.0 tok/s = naive 的 **3.30×**。实测明细见 §实测结果。
 
 ## 背景
 
@@ -69,39 +72,57 @@ mma 路径依赖的形状约束(`K % 128 == 0`、`block_k % 128 == 0`、`block_n
    16B/4B/2B 对齐链(uint4 A 需 K%8、uint4 W 需 K%16,均被 K%128 覆盖)。
 3. 项 2 的 split-kv 模拟器(`fp8_splitkv_sim.py`)同步回归 **ALL PASS**。
 
-## 预期收益(待实测)
+## 实测结果(2026-09-04,RTX 5090,CUDA 12.8 全量构建)
 
-- bs=8..32 decode 的 GEMM 从指令吞吐瓶颈切到 tensor core,权重流量不变,
-  单算子预期数倍于 SIMT M_TILE=16 路径;端到端以 bs=8/16 tok/s 回填。
-- 对 vLLM 的 3–5.4× 差距中,GEMM 部分预计显著收窄(其余在 attention/runtime)。
+- **算子对拍** `test/infiniop/fp8_blockwise_gemm.py --nvidia`(torch fp32 参考):
+  7 形状 × {F16,BF16,F32} = 21 case **全部通过**,MMA ON/OFF(`INFINIOP_FP8_GEMM_MMA=0`)
+  两轮皆过。M=13/16/32 × F16/BF16 命中 mma 路径,M ≤ 8 维持 SIMT,F32 走 M_TILE 回退——
+  mma fragment 布局理解经 GPU 独立验证无误(模拟器共享假设的风险项退役)。
+- **W7 顺带回归**:paged_caching / paged_attention / paged_attention_prefill 三算子
+  `--nvidia` 全过(split-kv 合入后 BF16/F16/FP8 case 无回归)。
 
-## 服务器待办(恢复后按序执行)
+**端到端 decode(examples/bench.py,Qwen3-8B-FP8 权重,paged attn,in=128/out=256;同 W4 基线配置)**:
 
-```bash
-# 0. 同步代码
-python3 dev_fp8/results/fp8_ssh.py push
-# 1. 构建 InfiniCore(xmake, sm_120)
-python3 dev_fp8/results/fp8_ssh.py run "bash /root/fp8/InfiniCore/dev_fp8_sync/fp8_build_core.sh"
-# 2. 算子正确性:M=13/16/32 自动命中 mma 路径,F32 用例覆盖 SIMT 回退
-python3 dev_fp8/results/fp8_ssh.py run "cd /root/fp8/InfiniCore && python3 test/infiniop/fp8_blockwise_gemm.py --nvidia"
-# 3. A/B 对照:mma 开关
-#    INFINIOP_FP8_GEMM_MMA=0 python3 test/infiniop/fp8_blockwise_gemm.py --nvidia
-# 4. 端到端 bench:bs=8/16 对比 W4 基线(382 tok/s @ bs=16 fused-SIMT / 427 naive)
-python3 dev_fp8/results/fp8_ssh.py run "bash /root/fp8/InfiniLM/dev_fp8_sync/fp8_perf_bench.sh"
-# 5. cuBLASLt block-scale spike(决定 W8A8 cuBLASLt 路线是否可行)
-python3 dev_fp8/results/fp8_ssh.py run "cd /root/fp8 && nvcc -O2 -arch=native dev_fp8_sync/fp8_cublaslt_spike.cu -o /tmp/fp8_cublaslt_spike -lcublasLt && /tmp/fp8_cublaslt_spike"
-```
+| 配置 | bs=8 | bs=16 | bs=32 |
+|---|---|---|---|
+| mma(新路径) | 408.7 tok/s | **1794.6 tok/s** | **2702.0 tok/s** |
+| SIMT fused(`MMA=0`) | — | 379.7(W4 基线 382 ✓) | — |
+| naive(`FUSED_GEMM=0`) | — | 427.0(W4 基线 427 ✓) | 817.6 |
+| **mma / naive** | — | **4.20×** | **3.30×** |
+| **mma / SIMT** | — | **4.73×** | — |
 
-(具体脚本路径以 `fp8_ssh.py push` 的同步布局为准;build 若报编译错误,先把
-`fp8_blockwise_gemm_nvidia.cu` 的 mma 段错误日志拉回本地修。)
+bs=8(M=8)按分派留在 SIMT M_TILE=8,408.7 ≈ W4 的 412,符合预期(不属 mma 区间)。
+各配置 TTFT 不变(bs=16 均 ~218ms;prefill M>32 仍走 naive),decode ITL bs=16 从
+42.14ms(SIMT)降到 8.92ms。bs=16 贪婪生成(in=128/out=48,temperature=0)mma 与
+naive 输出均连贯,开局一致后仅个别措辞分叉(GEMM 数值路径不同,语义等价)。
+
+- **对 vLLM 差距**:W4 时 bs≥8 落后 3–5.4× 的 GEMM 部分已被 mma 路径消除性收窄
+  (bs=16 fused 吞吐 382 → 1794.6);剩余差距在 attention/runtime,未复测 vLLM parity。
+- **cuBLASLt spike**:当前工具链 CUDA **12.8** 头文件无 block-scale API(需 ≥12.9),
+  仅 per-tensor FP8 可跑(algos=8,非 block scaling)。按既定判定标准,
+  **W8A8 cuBLASLt 路线在当前工具链不可行,自研 mma 即为 bs≥8 decode 的终点方案**;
+  若未来升级 CUDA ≥ 12.9 工具链可重跑 `fp8_cublaslt_spike.cu` 复核。
+- **注意**:服务器容器重启后 `/usr/local/cuda` 指回镜像自带 12.8;经查安装在
+  `/root/fp8/.infini` 的全部历史产物均为 12.8 编译(188 个对象 `.comment` 一致),
+  本次验证构建与 W3–W6 全部结果的工具链一致。`cuda13home` 实为 vLLM venv 的
+  cu13 pip 包 shim(nvcc 13.3 + runtime 头 13.0 混装,CCCL 版本校验不过,不能用于全量构建)。
+
+## 已完成的服务器验证清单(原"服务器待办")
+
+1. ✅ 代码同步(tarball:InfiniCore 17 文件 = W7 透传 + W7 split-kv + W8 mma;
+   InfiniLM `fp8_blockwise.cpp`),同步后 md5 全树比对一致。
+2. ✅ 构建:`xmake f -c --cuda=/usr/local/cuda --cuda_arch=sm_120 ...`(12.8),
+   修掉一处编译错误(`launch_mtile` 漏 `int M_TILE` 模板参数)后全链通过。
+3. ✅ 算子正确性 + A/B(上文)。
+4. ✅ 端到端 bench(上文表格)。
+5. ✅ cuBLASLt spike(上文结论)。
 
 ## 风险与回退
 
-- **数值**:promote 结构 = SIMT 路径的逐 chunk scale 累加,数学等价;bit-trick
-  输入逐位精确。风险点只剩 mma fragment 布局理解错误(模拟器已按同构逻辑覆盖,
-  但模拟器与 kernel 共享同一份索引假设——GPU 实测是第一道独立验证)。
-- **性能**:若 mma 路径实测仍输 cuBLAS naive(例如 K 流水被 sync 拖住),回退 =
-  `INFINIOP_FP8_GEMM_MMA=0` + InfiniLM 路由改回 `m <= 8`,一行改动。
-- **cuBLASLt 路线**:`fp8_cublaslt_spike.cu` 若显示 sm_120 放行 BLK128x128/VEC128
-  block scaling,则 W8A8(在线量化激活 + cuBLASLt)可能成为大 batch 的更优解,
-  届时另立工作项评估;若 algos=0(Hopper 限定),路线否决,自研 mma 即是终点。
+- **数值**(已退役):mma fragment 布局经 GPU 算子对拍独立验证(21/21),
+  promote 结构与 SIMT 路径数学等价,bit-trick 输入逐位精确。
+- **性能**(已退役):mma 路径实测 4.20×/4.73×(bs=16)、3.30×(bs=32)大胜 naive
+  与 SIMT,无需回退;回退开关保留:`INFINIOP_FP8_GEMM_MMA=0` + InfiniLM 路由
+  改回 `m <= 8`,一行改动。
+- **cuBLASLt 路线**(已裁决):12.8 工具链头文件无 block-scale API(需 ≥12.9),
+  当前不可行;升级工具链后可重跑 spike 复核。

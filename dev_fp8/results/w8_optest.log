@@ -1,0 +1,47 @@
+===== MMA ON =====
+Testing FP8 blockwise GEMM on NVIDIA with M=1, N=256, K=256, block=(128, 128), dtype=F16
+Testing FP8 blockwise GEMM on NVIDIA with M=1, N=256, K=256, block=(128, 128), dtype=BF16
+Testing FP8 blockwise GEMM on NVIDIA with M=1, N=256, K=256, block=(128, 128), dtype=F32
+Testing FP8 blockwise GEMM on NVIDIA with M=2, N=256, K=512, block=(128, 128), dtype=F16
+Testing FP8 blockwise GEMM on NVIDIA with M=2, N=256, K=512, block=(128, 128), dtype=BF16
+Testing FP8 blockwise GEMM on NVIDIA with M=2, N=256, K=512, block=(128, 128), dtype=F32
+Testing FP8 blockwise GEMM on NVIDIA with M=4, N=512, K=384, block=(64, 128), dtype=F16
+Testing FP8 blockwise GEMM on NVIDIA with M=4, N=512, K=384, block=(64, 128), dtype=BF16
+Testing FP8 blockwise GEMM on NVIDIA with M=4, N=512, K=384, block=(64, 128), dtype=F32
+Testing FP8 blockwise GEMM on NVIDIA with M=8, N=1024, K=512, block=(128, 256), dtype=F16
+Testing FP8 blockwise GEMM on NVIDIA with M=8, N=1024, K=512, block=(128, 256), dtype=BF16
+Testing FP8 blockwise GEMM on NVIDIA with M=8, N=1024, K=512, block=(128, 256), dtype=F32
+Testing FP8 blockwise GEMM on NVIDIA with M=16, N=4096, K=4096, block=(128, 128), dtype=F16
+Testing FP8 blockwise GEMM on NVIDIA with M=16, N=4096, K=4096, block=(128, 128), dtype=BF16
+Testing FP8 blockwise GEMM on NVIDIA with M=16, N=4096, K=4096, block=(128, 128), dtype=F32
+Testing FP8 blockwise GEMM on NVIDIA with M=13, N=2048, K=1024, block=(128, 128), dtype=F16
+Testing FP8 blockwise GEMM on NVIDIA with M=13, N=2048, K=1024, block=(128, 128), dtype=BF16
+Testing FP8 blockwise GEMM on NVIDIA with M=13, N=2048, K=1024, block=(128, 128), dtype=F32
+Testing FP8 blockwise GEMM on NVIDIA with M=32, N=768, K=1280, block=(128, 128), dtype=F16
+Testing FP8 blockwise GEMM on NVIDIA with M=32, N=768, K=1280, block=(128, 128), dtype=BF16
+Testing FP8 blockwise GEMM on NVIDIA with M=32, N=768, K=1280, block=(128, 128), dtype=F32
+[92mTest passed![0m
+===== MMA OFF (A/B) =====
+Testing FP8 blockwise GEMM on NVIDIA with M=1, N=256, K=256, block=(128, 128), dtype=F16
+Testing FP8 blockwise GEMM on NVIDIA with M=1, N=256, K=256, block=(128, 128), dtype=BF16
+Testing FP8 blockwise GEMM on NVIDIA with M=1, N=256, K=256, block=(128, 128), dtype=F32
+Testing FP8 blockwise GEMM on NVIDIA with M=2, N=256, K=512, block=(128, 128), dtype=F16
+Testing FP8 blockwise GEMM on NVIDIA with M=2, N=256, K=512, block=(128, 128), dtype=BF16
+Testing FP8 blockwise GEMM on NVIDIA with M=2, N=256, K=512, block=(128, 128), dtype=F32
+Testing FP8 blockwise GEMM on NVIDIA with M=4, N=512, K=384, block=(64, 128), dtype=F16
+Testing FP8 blockwise GEMM on NVIDIA with M=4, N=512, K=384, block=(64, 128), dtype=BF16
+Testing FP8 blockwise GEMM on NVIDIA with M=4, N=512, K=384, block=(64, 128), dtype=F32
+Testing FP8 blockwise GEMM on NVIDIA with M=8, N=1024, K=512, block=(128, 256), dtype=F16
+Testing FP8 blockwise GEMM on NVIDIA with M=8, N=1024, K=512, block=(128, 256), dtype=BF16
+Testing FP8 blockwise GEMM on NVIDIA with M=8, N=1024, K=512, block=(128, 256), dtype=F32
+Testing FP8 blockwise GEMM on NVIDIA with M=16, N=4096, K=4096, block=(128, 128), dtype=F16
+Testing FP8 blockwise GEMM on NVIDIA with M=16, N=4096, K=4096, block=(128, 128), dtype=BF16
+Testing FP8 blockwise GEMM on NVIDIA with M=16, N=4096, K=4096, block=(128, 128), dtype=F32
+Testing FP8 blockwise GEMM on NVIDIA with M=13, N=2048, K=1024, block=(128, 128), dtype=F16
+Testing FP8 blockwise GEMM on NVIDIA with M=13, N=2048, K=1024, block=(128, 128), dtype=BF16
+Testing FP8 blockwise GEMM on NVIDIA with M=13, N=2048, K=1024, block=(128, 128), dtype=F32
+Testing FP8 blockwise GEMM on NVIDIA with M=32, N=768, K=1280, block=(128, 128), dtype=F16
+Testing FP8 blockwise GEMM on NVIDIA with M=32, N=768, K=1280, block=(128, 128), dtype=BF16
+Testing FP8 blockwise GEMM on NVIDIA with M=32, N=768, K=1280, block=(128, 128), dtype=F32
+[92mTest passed![0m
+W8_OPTEST_DONE

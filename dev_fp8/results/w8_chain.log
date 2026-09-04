@@ -1,0 +1,73 @@
+===== REGRESS: paged trio =====
+--- paged_caching ---
+Testing PagedCaching FP8 on NVIDIA with num_seqs=1, max_seq_len=128, num_kv_heads=8, head_size=128, value_size=128, block_size=16, kv dtype=F16, cache dtype=F8
+Testing PagedCaching FP8 on NVIDIA with num_seqs=1, max_seq_len=128, num_kv_heads=8, head_size=128, value_size=128, block_size=16, kv dtype=BF16, cache dtype=F8
+Testing PagedCaching FP8 on NVIDIA with num_seqs=5, max_seq_len=512, num_kv_heads=40, head_size=128, value_size=128, block_size=16, kv dtype=F16, cache dtype=F8
+Testing PagedCaching FP8 on NVIDIA with num_seqs=5, max_seq_len=512, num_kv_heads=40, head_size=128, value_size=128, block_size=16, kv dtype=BF16, cache dtype=F8
+Testing PagedCaching FP8 on NVIDIA with num_seqs=16, max_seq_len=1024, num_kv_heads=8, head_size=64, value_size=64, block_size=32, kv dtype=F16, cache dtype=F8
+Testing PagedCaching FP8 on NVIDIA with num_seqs=16, max_seq_len=1024, num_kv_heads=8, head_size=64, value_size=64, block_size=32, kv dtype=BF16, cache dtype=F8
+Testing PagedCaching FP8 on NVIDIA with num_seqs=10, max_seq_len=1024, num_kv_heads=40, head_size=64, value_size=64, block_size=32, kv dtype=F16, cache dtype=F8
+Testing PagedCaching FP8 on NVIDIA with num_seqs=10, max_seq_len=1024, num_kv_heads=40, head_size=64, value_size=64, block_size=32, kv dtype=BF16, cache dtype=F8
+Testing PagedCaching FP8 on NVIDIA with num_seqs=2, max_seq_len=128, num_kv_heads=1, head_size=576, value_size=512, block_size=16, kv dtype=F16, cache dtype=F8
+Testing PagedCaching FP8 on NVIDIA with num_seqs=2, max_seq_len=128, num_kv_heads=1, head_size=576, value_size=512, block_size=16, kv dtype=BF16, cache dtype=F8
+[92mTest passed![0m
+--- paged_attention ---
+Testing PagedAttention FP8 on NVIDIA with num_seqs=1, num_heads=1, head_size=128, block_size=16, dtype=F16, use_alibi=False
+Testing PagedAttention FP8 on NVIDIA with num_seqs=1, num_heads=1, head_size=128, block_size=16, dtype=BF16, use_alibi=False
+Testing PagedAttention FP8 on NVIDIA with num_seqs=4, num_heads=40, head_size=128, block_size=16, dtype=F16, use_alibi=True
+Testing PagedAttention FP8 on NVIDIA with num_seqs=4, num_heads=40, head_size=128, block_size=16, dtype=BF16, use_alibi=True
+Testing PagedAttention FP8 on NVIDIA with num_seqs=1, num_heads=8, head_size=128, block_size=16, dtype=F16, use_alibi=True
+Testing PagedAttention FP8 on NVIDIA with num_seqs=1, num_heads=8, head_size=128, block_size=16, dtype=BF16, use_alibi=True
+Testing PagedAttention FP8 on NVIDIA with num_seqs=8, num_heads=64, head_size=128, block_size=16, dtype=F16, use_alibi=False
+Testing PagedAttention FP8 on NVIDIA with num_seqs=8, num_heads=64, head_size=128, block_size=16, dtype=BF16, use_alibi=False
+Testing PagedAttention FP8 on NVIDIA with num_seqs=3, num_heads=8, head_size=64, block_size=16, dtype=F16, use_alibi=False
+Testing PagedAttention FP8 on NVIDIA with num_seqs=3, num_heads=8, head_size=64, block_size=16, dtype=BF16, use_alibi=False
+[92mTest passed![0m
+--- paged_attention_prefill ---
+Testing PagedAttentionPrefill FP8 on NVIDIA with seqs:1, heads:4, head_size:128, value_size:128, block:8, max_step_len:16, num_rounds:2, dtype:F16, index_dtype:I64
+Testing PagedAttentionPrefill FP8 on NVIDIA with seqs:1, heads:4, head_size:128, value_size:128, block:8, max_step_len:16, num_rounds:2, dtype:BF16, index_dtype:I64
+Testing PagedAttentionPrefill FP8 on NVIDIA with seqs:2, heads:8, head_size:128, value_size:128, block:16, max_step_len:32, num_rounds:2, dtype:F16, index_dtype:I32
+Testing PagedAttentionPrefill FP8 on NVIDIA with seqs:2, heads:8, head_size:128, value_size:128, block:16, max_step_len:32, num_rounds:2, dtype:BF16, index_dtype:I32
+Testing PagedAttentionPrefill FP8 on NVIDIA with seqs:4, heads:16, head_size:128, value_size:128, block:8, max_step_len:64, num_rounds:2, dtype:F16, index_dtype:I64
+Testing PagedAttentionPrefill FP8 on NVIDIA with seqs:4, heads:16, head_size:128, value_size:128, block:8, max_step_len:64, num_rounds:2, dtype:BF16, index_dtype:I64
+Testing PagedAttentionPrefill FP8 on NVIDIA with seqs:2, heads:8, head_size:64, value_size:64, block:16, max_step_len:32, num_rounds:1, dtype:F16, index_dtype:I64
+Testing PagedAttentionPrefill FP8 on NVIDIA with seqs:2, heads:8, head_size:64, value_size:64, block:16, max_step_len:32, num_rounds:1, dtype:BF16, index_dtype:I64
+[92mTest passed![0m
+===== CUBLASLT SPIKE =====
+CUDA runtime 12.8, driver 13.3, cublasLt headers 0.0.0
+block-scale API: ABSENT (need CUDA >= 12.9 headers); only per-tensor FP8 control runs
+device: NVIDIA GeForce RTX 5090 (sm_120, 170 SMs)
+
+=== M=8 N=4096 K=4096 ===
+  [per-tensor FP8]        algos=8
+
+=== M=16 N=4096 K=4096 ===
+  [per-tensor FP8]        algos=8
+
+=== M=32 N=4096 K=4096 ===
+  [per-tensor FP8]        algos=8
+
+spike done. 判定标准:
+  - per-tensor algos=0        -> 该平台 FP8 不可用,路线否决
+  - block-scale algos=0       -> sm_120 未放行 block scaling(Hopper 限定),路线否决
+  - PASS 且 TFLOP/s 可观      -> 可作为 bs>=8 的 W8A8 备选路线(需在线量化激活)
+===== E2E BENCH =====
+--- PERF FP8_MMA_bs8 ---
+ Prefill TTFT: 144.51 ms  Throughput: 7086.2 tok/s
+ Decode  Avg ITL: 19.58 ms   Throughput: 408.67 tok/s
+--- PERF FP8_MMA_bs16 ---
+ Prefill TTFT: 218.49 ms  Throughput: 9373.51 tok/s
+ Decode  Avg ITL: 8.92 ms   Throughput: 1794.56 tok/s
+--- PERF FP8_MMA_bs32 ---
+ Prefill TTFT: 409.53 ms  Throughput: 10001.66 tok/s
+ Decode  Avg ITL: 11.84 ms   Throughput: 2701.97 tok/s
+--- PERF FP8_SIMT_bs16 (INFINIOP_FP8_GEMM_MMA=0) ---
+ Prefill TTFT: 218.65 ms  Throughput: 9366.44 tok/s
+ Decode  Avg ITL: 42.14 ms   Throughput: 379.67 tok/s
+--- PERF FP8_NAIVE_bs16 (INFINILM_FP8_FUSED_GEMM=0) ---
+ Prefill TTFT: 219.62 ms  Throughput: 9325.26 tok/s
+ Decode  Avg ITL: 37.47 ms   Throughput: 427.02 tok/s
+--- PERF FP8_NAIVE_bs32 ---
+ Prefill TTFT: 411.39 ms  Throughput: 9956.37 tok/s
+ Decode  Avg ITL: 39.14 ms   Throughput: 817.64 tok/s
+W8_CHAIN_DONE
