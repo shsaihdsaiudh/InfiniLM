@@ -4,7 +4,8 @@
 > 见 `w6_kv_fp8_report.md` §4）。根因：FP8 decode kernel 是 CTA per (seq, q_head)，bs=1 时全卡仅
 > 32 CTA（Qwen3-8B 32 q head），170 个 SM 只占 19%；对照 BF16 tuned kernel 有 4 路 split-kv。
 >
-> **状态：代码已完成并通过 CPU 逻辑模拟；服务器（RTX 5090）暂不可用，构建/对拍/bench 待补。**
+> **状态：GPU 验证已完成（2026-09-05，RTX 5090，sm_120）——算子对拍全绿，bs=1 in=4k/16k 残留差距从
+> 1.14×/1.27× 抹平并反超至 0.77×/0.58×，E2E 贪婪对拍与 BF16 KV 逐 token 一致。见 §4。**
 
 ## 1. 方案（flash-decoding 标准做法）
 
@@ -51,24 +52,58 @@ CPU 模拟（逐行复刻 cursor 推进 + 两级在线 softmax 合并 + -inf 判
 - 300 组随机数值（含 alibi、hd 64/128、空 shard），split+combine 结果与直接 softmax
   相对误差 ≤1e-6。
 
-## 4. 待服务器恢复后执行
+## 4. GPU 验证结果（2026-09-05，RTX 5090，sm_120，lib 由 InfiniCore@2f931ee2 构建）
+
+**算子对拍**（`test/infiniop/paged_attention.py --nvidia`）：28 个 case 全部 PASS，
+含新增 `(1, 8, 8, 128, 16, 4096, alibi=True)`。`INFINIOP_FLASH_DEBUG_SPLITS=1` 确认
+split 路径在 GPU 真实触发（该用例 num_splits=8），大 grid 用例（heads=40 seqs=4）
+正确保持 num_splits=1。
+
+**E2E 性能**（examples/bench.py，Qwen3-8B-FP8 权重，out=128，Decode Avg ITL，ms）：
+
+| 场景 | KV BF16 | FP8 split=auto | FP8/BF16 | FP8 split=0 | W6 FP8/BF16 |
+|---|---|---|---|---|---|
+| bs=1 in=1024 | 7.85 | 7.27 | **0.93×** | 8.35 | 1.05× |
+| bs=1 in=4096 | 10.29 | 7.96 | **0.77×** | 11.92 | 1.14× |
+| bs=1 in=16384 | 20.58 | 11.93 | **0.58×** | 26.47 | 1.27× |
+| bs=8 in=1024 | 20.84 | 22.84 | 1.10× | 22.00 | 1.05× |
+| bs=8 in=4096 | 25.31 | 29.09 | 1.15× | 29.76 | 1.17× |
+| bs=8 in=16384 | warmup OOM（bench 既有行为，两 dtype 一致，与 W6 相同） | | | | |
+
+- 主目标超额完成：bs=1 in=4k/16k 从 1.14×/1.27× **抹平并反超**至 0.77×/0.58×——
+  split-kv 补齐并行度后，FP8 KV 带宽减半开始净赚；bs=1 in=1k 同步改善（1.05×→0.93×）。
+- 回归对照成立：SPLITKV=0 与 W6 逐点吻合（11.92 vs 11.94、26.47 vs 26.42、29.76 vs 29.82），
+  同会话 BF16 基线与 W6 偏差 ≤1%——收益全部来自 split-kv，无其他变量。
+- split 决策（auto）：bs=1 各长度 num_splits=5；bs=8 num_splits=7；TTFT 不变（prefill 未动）。
+
+**启发式扫描**（INFINIOP_FLASH_NUM_SPLITS 定点复测）：
+
+- bs=1/16k：auto(5)=11.93 优于固定 8=12.24，auto 已最优。
+- bs=8/4k：splits=1→29.76 / 2→29.82 / 4→29.08 / auto(7)→29.09，auto 已在最优点。
+- bs=8/1k：splits=1→22.00 < 2→22.37 < 4→22.62 < auto(7)→22.84 —— 唯一过拆 cell（+3.8%）。
+  根因：共享 makespan 模型按 1 CTA/SM 估 wave，未计入 FP8 kernel 1024 线程 CTA 的
+  2 CTA/SM 共驻（bs=8 时 256 block 实际一波即可装下）。改动需 fork 与 BF16 家族共享的
+  `chooseNumSplitsHeuristic`、绝对差距 <1ms，维持 auto 不改；bs=8 短上下文敏感场景可用
+  `INFINIOP_FLASH_DECODE_SPLITKV=0` 规避。
+
+**E2E 贪婪对拍**（`dev_fp8/results/w7_e2e_parity.py`，4020-token prompt + 48 token 生成，
+top_k=1）：FP8 KV（DEBUG_SPLITS 确认 split=5 生效）与 BF16 KV 输出**逐 token 完全一致**
+（PARITY: MATCH）。注：examples/test_infer.py 的 LLM 封装不支持 kv_cache_dtype，
+对拍脚本直接驱动 InferEngine（与 bench.py 同路径）。
+
+**精度链**：PPL/C-Eval/MMLU 走 prefill 路径（未动），沿用 W6 结论；decode 数值由
+算子对拍（相对误差容差内，含 split+combine 组合）与 E2E 逐 token 一致覆盖。
+
+**结论：KV FP8 线（W6+W7）闭环。**
+
+复跑命令（脚本已 push 至服务器 /root/fp8/ 与 /root/fp8/InfiniLM/dev_fp8/results/）：
 
 ```bash
-# 1) 同步并构建（脚本在 dev_fp8/results/，注意先 push 到 /root/fp8/）
-python3 dev_fp8/results/fp8_ssh.py push <InfiniCore 改动> /root/fp8/InfiniCore/
 python3 dev_fp8/results/fp8_ssh.py bg w7_build 'bash /root/fp8/fp8_build_core.sh'
-
-# 2) 算子对拍（FP8 case 必须全绿，含新 alibi+split 用例）
-python3 dev_fp8/results/fp8_ssh.py run 'cd /root/fp8/InfiniCore && python3 test/infiniop/paged_attention.py --nvidia'
-
-# 3) E2E 性能：bs=1/8 × in=1k/4k/16k，FP8 KV 对比 W6 表（bench.py --kv-cache-dtype fp8）
-#    另跑 INFINIOP_FLASH_DEBUG_SPLITS=1 确认各场景 num_splits 决策。
-#    回归对照：INFINIOP_FLASH_DECODE_SPLITKV=0（应回到 W6 数字）。
+python3 dev_fp8/results/fp8_ssh.py run 'source /root/fp8/fp8_env.sh && cd /root/fp8/InfiniCore && python3 test/infiniop/paged_attention.py --nvidia'
+python3 dev_fp8/results/fp8_ssh.py bg w7_bench 'bash /root/fp8/w7_splitkv_bench.sh'
+# 原始日志：/root/fp8/eval_logs/w7_{optest,bench_*,e2e_parity}.log
 ```
-
-预期：bs=1 in=4k/16k 的 1.14×/1.27× 基本收敛到 ~1.0×；bs=1 in=1k 与 bs=8 场景不退化
-（启发式在大 grid 下不 split；combine 为微秒级小 kernel）。精度指标（PPL/C-Eval/MMLU）
-数值语义不变，可选跑 `w6_accuracy_chain.sh` 抽查。
 
 ## 5. 风险与注意
 
